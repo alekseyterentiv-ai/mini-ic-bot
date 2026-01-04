@@ -1,16 +1,17 @@
 import os
+import json
 from flask import Flask, request
 
 app = Flask(name)
 
-@app.route("/", methods=["GET"])
+@app.get("/")
 def index():
     return "OK", 200
 
-@app.route("/webhook", methods=["POST"])
+@app.post("/webhook")
 def webhook():
-    data = request.json
-    print(data)
+    data = request.get_json(silent=True)
+    print(json.dumps(data, ensure_ascii=False))
     return "ok", 200
 
 if name == "main":

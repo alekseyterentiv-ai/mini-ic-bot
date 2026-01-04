@@ -10,6 +10,9 @@ def index():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json(silent=True)
     print(json.dumps(data, ensure_ascii=False))
     return "ok", 200
+
+if name == "main":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

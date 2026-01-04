@@ -2,7 +2,7 @@ import os
 import json
 from flask import Flask, request
 
-app = Flask(name)
+app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def index():

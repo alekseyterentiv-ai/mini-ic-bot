@@ -3,7 +3,7 @@ import os
 import json
 import requests
 
-app = Flask(name)
+app = Flask(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{TOKEN}"

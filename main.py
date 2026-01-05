@@ -7,6 +7,8 @@ app = Flask(__name__)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
+if not TOKEN:
+    print("ERROR: TELEGRAM_TOKEN is not set")
 
 @app.get("/")
 def index():

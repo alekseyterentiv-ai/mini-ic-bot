@@ -1,14 +1,14 @@
+from flask import Flask, request
 import os
 import json
+import time
 import re
-from datetime import datetime
-
+import tempfile
 import requests
-from flask import Flask, request
+from datetime import datetime
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-
 
 app = Flask(__name__)
 
@@ -17,43 +17,77 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
-SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ").strip()
+SHEET_OPS = os.environ.get("SHEET_OPS", "").strip()  # например: ОПЕРАЦИИ
 
-# GOOGLE_SA_JSON = json string (из Secret Manager exposed as env)
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Период: YYYY-MM-1 или YYYY-MM-2
-PERIOD_RE = re.compile(r"^\d{4}-\d{2}-[12]$")
+# --- Anti-dup settings ---
+DEDUP_TTL_SECONDS = 6 * 60 * 60          # MessageID защита (6 часов)
+CONTENT_DEDUP_WINDOW_SECONDS = 30         # окно антидубля по тексту
+
+# In-memory caches (Cloud Run может перезапускать/масштабировать — это ок для базовой защиты)
+_seen_message_ids = {}        # message_id -> ts
+_seen_content = {}            # (chat_id, normalized_text) -> ts
 
 
-def tg_send(chat_id: int, text: str):
+def _cleanup_caches(now_ts: float) -> None:
+    # чистим message_id
+    to_del = [k for k, ts in _seen_message_ids.items() if now_ts - ts > DEDUP_TTL_SECONDS]
+    for k in to_del:
+        _seen_message_ids.pop(k, None)
+
+    # чистим контент
+    to_del = [k for k, ts in _seen_content.items() if now_ts - ts > CONTENT_DEDUP_WINDOW_SECONDS]
+    for k in to_del:
+        _seen_content.pop(k, None)
+
+
+def send_message(chat_id: int, text: str) -> None:
     try:
         requests.post(
             f"{TG_API}/sendMessage",
             json={"chat_id": chat_id, "text": text},
-            timeout=10,
+            timeout=20,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print("send_message error:", repr(e))
 
 
-def get_sheets_service():
+def build_sheets_service():
     if not GOOGLE_SA_JSON:
         raise RuntimeError("GOOGLE_SA_JSON is empty")
-    info = json.loads(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+
+    # GOOGLE_SA_JSON может быть строкой JSON
+    sa_info = json.loads(GOOGLE_SA_JSON)
+
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
+def append_row(row):
+    service = build_sheets_service()
+    # ВАЖНО: range = только имя листа (без !A), иначе возможны ошибки парсинга
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=SHEET_OPS,
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]},
+    ).execute()
+
+
 def validate_and_parse(text: str):
+    # ожидаем: 9 полей
+    # ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТАРИЙ
     parts = [p.strip() for p in text.split(";")]
 
     if len(parts) != 9:
-        return None, "❌ Ошибка формата: должно быть 9 полей через ;"
+        return None, "❌ Ошибка формата: должно быть 9 полей через ;\nПример:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; тест"
 
     object_, type_, article, amount_raw, pay_type, vat, period_raw, employee, comment = parts
+
+    if not object_ or not type_ or not article or not amount_raw:
+        return None, "❌ Не хватает обязательных полей: ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА"
 
     # Тип
     type_up = type_.upper()
@@ -66,7 +100,7 @@ def validate_and_parse(text: str):
         amount = float(amt)
         if amount <= 0:
             return None, "❌ Сумма должна быть больше 0"
-    except Exception:
+    except:
         return None, "❌ Сумма должна быть числом"
 
     # НДС
@@ -74,14 +108,12 @@ def validate_and_parse(text: str):
     if vat_up not in ("ДА", "НЕТ"):
         return None, "❌ НДС только ДА или НЕТ"
 
-    # Период (НЕ дата!)
-    period = period_raw.strip()
-    if not PERIOD_RE.match(period):
+    # Период: YYYY-MM-1 или YYYY-MM-2
+    # (важно: именно так, это НЕ дата)
+    if not re.match(r"^\d{4}-\d{2}-[12]$", period_raw):
         return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
 
-    # Минимальная проверка обязательных
-    if not object_ or not article or not pay_type:
-        return None, "❌ Не хватает обязательных полей: объект; статья; способ оплаты"
+    period = period_raw
 
     return {
         "object": object_,
@@ -96,124 +128,87 @@ def validate_and_parse(text: str):
     }, None
 
 
-def load_recent_message_keys(service, limit=500):
-    """
-    Берем колонку M (MessageID) и делаем set последних значений.
-    Чтобы быстро и стабильно.
-    """
-    resp = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_OPS}!M2:M")
-        .execute()
-    )
-    values = resp.get("values", [])
-    flat = [row[0] for row in values if row]
-    if len(flat) > limit:
-        flat = flat[-limit:]
-    return set(flat)
-
-
-def append_row(service, row):
-    # ВАЖНО: range = только имя листа (без !A)
-    return (
-        service.spreadsheets()
-        .values()
-        .append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=SHEET_OPS,
-            valueInputOption="USER_ENTERED",
-            body={"values": [row]},
-        )
-        .execute()
-    )
-
-
 @app.get("/")
 def index():
-    return "ok"
+    return "ok", 200
 
 
 @app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True) or {}
+    # print("update:", json.dumps(data, ensure_ascii=False))
 
     msg = data.get("message") or data.get("edited_message")
     if not msg:
-        return ("ok", 200)
+        return "no message", 200
 
     chat_id = (msg.get("chat") or {}).get("id")
-    text = (msg.get("text") or "").strip()
-
     if not chat_id:
-        return ("ok", 200)
+        return "no chat", 200
+
+    message_id = msg.get("message_id")
+    text = (msg.get("text") or "").strip()
 
     # /start
     if text.startswith("/start"):
-        tg_send(
+        send_message(
             chat_id,
             "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий",
         )
-        return ("ok", 200)
+        return "ok", 200
+
+    now_ts = time.time()
+    _cleanup_caches(now_ts)
+
+    # --- Anti-dup by MessageID ---
+    if message_id is not None:
+        if message_id in _seen_message_ids:
+            # уже обрабатывали
+            return "dup message_id", 200
+        _seen_message_ids[message_id] = now_ts
+
+    # --- Anti-dup by content within 30s (per chat) ---
+    norm_text = re.sub(r"\s+", " ", text).strip().lower()
+    key = (chat_id, norm_text)
+    if norm_text:
+        last_ts = _seen_content.get(key)
+        if last_ts and (now_ts - last_ts) <= CONTENT_DEDUP_WINDOW_SECONDS:
+            return "dup content", 200
+        _seen_content[key] = now_ts
 
     parsed, err = validate_and_parse(text)
     if err:
-        tg_send(chat_id, err)
-        return ("ok", 200)
-
-    # message_id + chat_id => уникальный ключ
-    message_id = msg.get("message_id")
-    message_key = f"{chat_id}:{message_id}" if message_id is not None else ""
-
-    # now
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Row строго под колонки:
-    # A Datetime
-    # B Объект
-    # C Тип
-    # D Статья
-    # E СуммаБаза
-    # F СпособОплаты
-    # G НДС
-    # H Категория (пусто)
-    # I ПЕРИОД
-    # J Сотрудник
-    # K Статус (пусто)
-    # L Источник
-    # M MessageID
-    # N Комментарий
-    row = [
-        now,
-        parsed["object"],
-        parsed["type"],
-        parsed["article"],
-        parsed["amount"],
-        parsed["pay_type"],
-        parsed["vat"],
-        "",
-        parsed["period"],
-        parsed["employee"],
-        "",
-        "TELEGRAM",
-        message_key,
-        parsed["comment"],
-    ]
+        send_message(chat_id, err)
+        return "bad format", 200
 
     try:
-        service = get_sheets_service()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # антидубли
-        if message_key:
-            existing = load_recent_message_keys(service, limit=500)
-            if message_key in existing:
-                tg_send(chat_id, "⚠️ Уже записано (дубль).")
-                return ("ok", 200)
+        row = [
+            now_str,                 # A DateTime
+            parsed["object"],        # B Объект
+            parsed["type"],          # C Тип
+            parsed["article"],       # D Статья
+            parsed["amount"],        # E СуммаБаза
+            parsed["pay_type"],      # F СпособОплаты
+            parsed["vat"],           # G НДС
+            "",                      # H Категория (пусто)
+            parsed["period"],        # I ПЕРИОД (YYYY-MM-1/2)
+            parsed["employee"],      # J Сотрудник
+            "",                      # K Статус (пусто)
+            "TELEGRAM",              # L Источник
+            str(message_id or ""),   # M MessageID (не пустой если есть)
+        ]
 
-        append_row(service, row)
-        tg_send(chat_id, "✅ Записал")
-
+        append_row(row)
+        send_message(chat_id, "✅ Записал")
     except Exception as e:
-        tg_send(chat_id, f"Ошибка записи в таблицу: {e}")
+        print("append error:", repr(e))
+        send_message(chat_id, f"Ошибка записи в таблицу: {e}")
 
-    return ("ok", 200)
+    return "ok", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)

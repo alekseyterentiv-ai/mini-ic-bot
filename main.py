@@ -3,7 +3,6 @@ import os
 import json
 import time
 import re
-import tempfile
 import requests
 from datetime import datetime
 
@@ -17,14 +16,15 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
-SHEET_OPS = os.environ.get("SHEET_OPS", "").strip()  # например: ОПЕРАЦИИ
+SHEET_OPS = os.environ.get("SHEET_OPS", "").strip()          # например: ОПЕРАЦИИ
+SHEET_LOGS = os.environ.get("SHEET_LOGS", "ЛОГИ").strip()     # лист для логов
 
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # --- Anti-dup settings ---
 DEDUP_TTL_SECONDS = 6 * 60 * 60          # MessageID защита (6 часов)
-CONTENT_DEDUP_WINDOW_SECONDS = 30         # окно антидубля по тексту
+CONTENT_DEDUP_WINDOW_SECONDS = 30        # окно антидубля по тексту
 
 # In-memory caches (Cloud Run может перезапускать/масштабировать — это ок для базовой защиты)
 _seen_message_ids = {}        # message_id -> ts
@@ -58,22 +58,53 @@ def build_sheets_service():
     if not GOOGLE_SA_JSON:
         raise RuntimeError("GOOGLE_SA_JSON is empty")
 
-    # GOOGLE_SA_JSON может быть строкой JSON
     sa_info = json.loads(GOOGLE_SA_JSON)
-
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
-def append_row(row):
-    service = build_sheets_service()
-    # ВАЖНО: range = только имя листа (без !A), иначе возможны ошибки парсинга
+def append_row_with_service(service, sheet_name: str, row: list):
+    # ВАЖНО: range = только имя листа (без !A)
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_OPS,
+        range=sheet_name,
         valueInputOption="USER_ENTERED",
         body={"values": [row]},
     ).execute()
+
+
+def log_action(service, now_str: str, chat_id, user_id, username, full_name,
+               message_id, text, status: str, error_text: str = ""):
+    """
+    Лист ЛОГИ (A..J):
+    A Datetime
+    B ChatID
+    C UserID
+    D Username
+    E FullName
+    F MessageID
+    G Text
+    H Status (OK/ERROR/DUPLICATE/INFO)
+    I ErrorText
+    J Source
+    """
+    try:
+        row = [
+            now_str,
+            str(chat_id or ""),
+            str(user_id or ""),
+            str(username or ""),
+            str(full_name or ""),
+            str(message_id or ""),
+            str(text or ""),
+            status,
+            str(error_text or ""),
+            "TELEGRAM",
+        ]
+        append_row_with_service(service, SHEET_LOGS, row)
+    except Exception as e:
+        # логи не должны ломать основную работу
+        print("log_action error:", repr(e))
 
 
 def validate_and_parse(text: str):
@@ -82,7 +113,11 @@ def validate_and_parse(text: str):
     parts = [p.strip() for p in text.split(";")]
 
     if len(parts) != 9:
-        return None, "❌ Ошибка формата: должно быть 9 полей через ;\nПример:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; тест"
+        return None, (
+            "❌ Ошибка формата: должно быть 9 полей через ;\n"
+            "Пример:\n"
+            "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; тест"
+        )
 
     object_, type_, article, amount_raw, pay_type, vat, period_raw, employee, comment = parts
 
@@ -108,8 +143,7 @@ def validate_and_parse(text: str):
     if vat_up not in ("ДА", "НЕТ"):
         return None, "❌ НДС только ДА или НЕТ"
 
-    # Период: YYYY-MM-1 или YYYY-MM-2
-    # (важно: именно так, это НЕ дата)
+    # Период: YYYY-MM-1 или YYYY-MM-2 (это НЕ дата)
     if not re.match(r"^\d{4}-\d{2}-[12]$", period_raw):
         return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
 
@@ -136,18 +170,35 @@ def index():
 @app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True) or {}
-    # print("update:", json.dumps(data, ensure_ascii=False))
-
     msg = data.get("message") or data.get("edited_message")
     if not msg:
         return "no message", 200
 
-    chat_id = (msg.get("chat") or {}).get("id")
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
     if not chat_id:
         return "no chat", 200
 
+    frm = msg.get("from") or {}
+    user_id = frm.get("id")
+    username = frm.get("username", "")
+    full_name = (str(frm.get("first_name", "")) + " " + str(frm.get("last_name", ""))).strip()
+
     message_id = msg.get("message_id")
     text = (msg.get("text") or "").strip()
+
+    now_ts = time.time()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Поднимаем сервис один раз на запрос (и для операций, и для логов)
+    service = None
+    try:
+        service = build_sheets_service()
+    except Exception as e:
+        # даже если Sheets упал — отвечаем, и лог локально в консоль
+        print("build_sheets_service error:", repr(e))
+        send_message(chat_id, "❌ Ошибка доступа к Google Sheets (проверь GOOGLE_SA_JSON/доступ к таблице).")
+        return "ok", 200
 
     # /start
     if text.startswith("/start"):
@@ -155,15 +206,16 @@ def webhook():
             chat_id,
             "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий",
         )
+        log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "INFO", "/start")
         return "ok", 200
 
-    now_ts = time.time()
     _cleanup_caches(now_ts)
 
     # --- Anti-dup by MessageID ---
     if message_id is not None:
         if message_id in _seen_message_ids:
-            # уже обрабатывали
+            send_message(chat_id, "⚠️ Дубль (message_id). Уже обработано.")
+            log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "DUPLICATE", "message_id")
             return "dup message_id", 200
         _seen_message_ids[message_id] = now_ts
 
@@ -173,38 +225,42 @@ def webhook():
     if norm_text:
         last_ts = _seen_content.get(key)
         if last_ts and (now_ts - last_ts) <= CONTENT_DEDUP_WINDOW_SECONDS:
+            send_message(chat_id, "⚠️ Дубль по содержимому (30 сек). Не записываю.")
+            log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "DUPLICATE", "content_30s")
             return "dup content", 200
         _seen_content[key] = now_ts
 
     parsed, err = validate_and_parse(text)
     if err:
         send_message(chat_id, err)
+        log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "ERROR", err)
         return "bad format", 200
 
     try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+        # ОПЕРАЦИИ: A..M
         row = [
-            now_str,                 # A DateTime
-            parsed["object"],        # B Объект
-            parsed["type"],          # C Тип
-            parsed["article"],       # D Статья
-            parsed["amount"],        # E СуммаБаза
-            parsed["pay_type"],      # F СпособОплаты
-            parsed["vat"],           # G НДС
-            "",                      # H Категория (пусто)
-            parsed["period"],        # I ПЕРИОД (YYYY-MM-1/2)
-            parsed["employee"],      # J Сотрудник
-            "",                      # K Статус (пусто)
-            "TELEGRAM",              # L Источник
-            str(message_id or ""),   # M MessageID (не пустой если есть)
+            now_str,                # A DateTime
+            parsed["object"],       # B Объект
+            parsed["type"],         # C Тип
+            parsed["article"],      # D Статья
+            parsed["amount"],       # E СуммаБаза
+            parsed["pay_type"],     # F СпособОплаты
+            parsed["vat"],          # G НДС
+            "",                     # H Категория (пусто)
+            parsed["period"],       # I ПЕРИОД (YYYY-MM-1/2)
+            parsed["employee"],     # J Сотрудник
+            "",                     # K Статус (пусто)
+            "TELEGRAM",             # L Источник
+            str(message_id or ""),  # M MessageID
         ]
 
-        append_row(row)
+        append_row_with_service(service, SHEET_OPS, row)
         send_message(chat_id, "✅ Записал")
+        log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "OK", "")
     except Exception as e:
         print("append error:", repr(e))
         send_message(chat_id, f"Ошибка записи в таблицу: {e}")
+        log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "ERROR", f"append: {e}")
 
     return "ok", 200
 

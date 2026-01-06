@@ -11,7 +11,9 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# --- ENV ---
+# =========================
+# ENV
+# =========================
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
@@ -22,54 +24,131 @@ SHEET_LOGS = os.environ.get("SHEET_LOGS", "ЛОГИ").strip()
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# --- Anti-dup settings ---
-DEDUP_TTL_SECONDS = 6 * 60 * 60            # MessageID защита (6 часов)
-CONTENT_DEDUP_WINDOW_SECONDS = 30           # окно антидубля по тексту
+# =========================
+# СПРАВОЧНИКИ
+# =========================
+OBJECTS = [
+    "ОКТЯБРЬСКИЙ",
+    "ОБУХОВО",
+    "ОДИНЦОВО",
+    "ЭКИПАЖ",
+    "24 СКЛАД",
+    "ЯРЦЕВО",
+    "ОБЩЕХОЗ",
+]
 
-_seen_message_ids = {}        # message_id -> ts
-_seen_content = {}            # (chat_id, normalized_text) -> ts
+TYPES = ["РАСХОД", "ЗП", "АВАНС", "ДОХОД"]
 
-# cache sheet title -> sheetId
-_sheet_id_cache = {}          # title -> sheetId
+ARTICLES = [
+    "ОФИС",
+    "КАНЦТОВАРЫ",
+    "СВЯЗЬ/ИНТЕРНЕТ",
+    "1С",
+    "КВАРТИРА",
+    "ХОСТЕЛ",
+    "ЗП НАЛ",
+    "ЗП ОФИЦ",
+    "СИЗ",
+    "МЕД КИЖКИ",
+    "ОБУЧЕНИЕ/ИНСТРУКТАЖИ",
+    "ТАКСИ",
+    "БИЛЕТЫ",
+    "БЕНЗИН",
+    "РЕМОНТ АВТО",
+    "ИНСТРУМЕНТ",
+    "РЕМОНТ И ОБСЛУЖИВАНИЕ",
+    "УСЛУГИ СТОРОННИЕ",
+    "ШТРАФЫ/ПЕНИ",
+    "МАРКЕТИНГ/ПРЕДСТАВИТЕЛЬСКИЕ",
+    "ПОДАРКИ",
+    "СКУДЫ",
+    "КРЕДИТ",
+    "% ПО КРЕДИТУ",
+    "КОМИССИИ БАНКА",
+]
+
+PAY_TYPES = ["НАЛ", "БЕЗНАЛ", "ЗП_ОФИЦ", "АВАНС", "ПРЕДОПЛАТА"]
+VAT_VALUES = ["ДА", "НЕТ"]
+
+# =========================
+# НАСТРОЙКИ / КЕШИ
+# =========================
+DEDUP_TTL_SECONDS = 6 * 60 * 60
+CONTENT_DEDUP_WINDOW_SECONDS = 30
+
+_seen_message_ids = {}   # message_id -> ts
+_seen_content = {}       # (chat_id, norm_text) -> ts
+
+# /new flow state
+_new_flow = {}           # chat_id -> {"step": int, "data": dict, "ts": float}
+NEW_FLOW_TTL = 30 * 60   # 30 минут
+
+_sheets_service = None
+_sheet_id_cache = {}     # title -> sheetId
+
+
+# =========================
+# TELEGRAM HELPERS
+# =========================
+def kb(rows):
+    # rows: [["A","B"],["C"]]
+    return {
+        "keyboard": [[{"text": x} for x in r] for r in rows],
+        "resize_keyboard": True,
+        "one_time_keyboard": True
+    }
+
+
+def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=20)
+    except Exception as e:
+        print("send_message error:", repr(e))
+
+
+def normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
 def _cleanup_caches(now_ts: float) -> None:
-    # чистим message_id
     to_del = [k for k, ts in _seen_message_ids.items() if now_ts - ts > DEDUP_TTL_SECONDS]
     for k in to_del:
         _seen_message_ids.pop(k, None)
 
-    # чистим контент
     to_del = [k for k, ts in _seen_content.items() if now_ts - ts > CONTENT_DEDUP_WINDOW_SECONDS]
     for k in to_del:
         _seen_content.pop(k, None)
 
 
-def send_message(chat_id: int, text: str) -> None:
-    try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20,
-        )
-    except Exception as e:
-        print("send_message error:", repr(e))
-
-
+# =========================
+# GOOGLE SHEETS HELPERS
+# =========================
 def build_sheets_service():
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
+
     if not GOOGLE_SA_JSON:
         raise RuntimeError("GOOGLE_SA_JSON is empty")
+
     sa_info = json.loads(GOOGLE_SA_JSON)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return _sheets_service
 
 
 def _get_sheet_id(service, title: str) -> int:
-    # cache first
     if title in _sheet_id_cache:
         return _sheet_id_cache[title]
 
-    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    meta = service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID,
+        fields="sheets(properties(sheetId,title))"
+    ).execute()
+
     for sh in meta.get("sheets", []):
         props = sh.get("properties", {})
         if props.get("title") == title:
@@ -77,158 +156,180 @@ def _get_sheet_id(service, title: str) -> int:
             _sheet_id_cache[title] = sid
             return sid
 
-    raise RuntimeError(f"Sheet '{title}' not found in spreadsheet")
+    raise RuntimeError(f"Sheet '{title}' not found")
 
 
-def _parse_row_num_from_updated_range(updated_range: str) -> int | None:
-    """
-    updated_range like: 'ОПЕРАЦИИ!A348:M348' -> returns 348
-    """
-    if not updated_range:
-        return None
-    m = re.search(r"!A(\d+):", updated_range)
-    if not m:
-        m = re.search(r"!(?:[A-Z]+)(\d+):", updated_range)
-    if not m:
-        return None
-    return int(m.group(1))
-
-
-def append_row(sheet_name: str, row: list) -> tuple[int | None, str | None]:
-    """
-    Returns: (row_number, updated_range)
-    """
-    service = build_sheets_service()
-    resp = service.spreadsheets().values().append(
+def append_row(sheet_name: str, row: list):
+    svc = build_sheets_service()
+    svc.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=sheet_name,                # ТОЛЬКО имя листа
+        range=sheet_name,
         valueInputOption="USER_ENTERED",
-        body={"values": [row]},          # ВАЖНО: двойные скобки, иначе поедет "вбок"
+        insertDataOption="INSERT_ROWS",
+        body={"majorDimension": "ROWS", "values": [row]},
     ).execute()
 
-    updated_range = (resp.get("updates") or {}).get("updatedRange")
-    row_num = _parse_row_num_from_updated_range(updated_range or "")
-    return row_num, updated_range
+
+def read_sheet_rows(sheet_name: str, rng: str):
+    # rng example "A:J"
+    svc = build_sheets_service()
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!{rng}",
+        majorDimension="ROWS"
+    ).execute()
+    return resp.get("values", [])
 
 
-def delete_row(sheet_title: str, row_number_1_based: int) -> None:
-    """
-    Deletes a row by 1-based row number in the given sheet.
-    Google API uses 0-based indexes in deleteDimension: startIndex inclusive, endIndex exclusive.
-    """
-    if row_number_1_based <= 0:
+def read_column(sheet_name: str, col: str):
+    # col example "M:M"
+    svc = build_sheets_service()
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{sheet_name}!{col}",
+        majorDimension="COLUMNS"
+    ).execute()
+    cols = resp.get("values", [])
+    return cols[0] if cols and cols[0] else []
+
+
+def delete_row(sheet_name: str, row_number_1based: int):
+    if row_number_1based <= 0:
         raise ValueError("row_number must be >= 1")
+    svc = build_sheets_service()
+    sid = _get_sheet_id(svc, sheet_name)
 
-    service = build_sheets_service()
-    sheet_id = _get_sheet_id(service, sheet_title)
+    start = row_number_1based - 1
+    end = row_number_1based
 
-    start_index = row_number_1_based - 1
-    end_index = row_number_1_based
-
-    body = {
-        "requests": [
-            {
-                "deleteDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "startIndex": start_index,
-                        "endIndex": end_index,
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sid,
+                            "dimension": "ROWS",
+                            "startIndex": start,
+                            "endIndex": end,
+                        }
                     }
                 }
-            }
-        ]
-    }
-    service.spreadsheets().batchUpdate(
-        spreadsheetId=SPREADSHEET_ID,
-        body=body
+            ]
+        }
     ).execute()
 
 
-def read_last_logs(limit: int = 300) -> list[list]:
-    """
-    Reads last N rows from LOGS by grabbing a tail range.
-    Note: Sheets API doesn't have "last rows" query; we read a wide range and take tail.
-    """
-    service = build_sheets_service()
-    resp = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_LOGS}!A:K"
-    ).execute()
-    values = resp.get("values", [])
-    return values[-limit:]
-
-
-def log_action(chat_id, user_id, username, full_name, message_id, text, status, error_text, action, ops_row_num=None):
+# =========================
+# LOGS
+# =========================
+def log_event(chat_id, user_id, username, full_name, message_id, text, status, error_text=""):
+    # ЛОГИ: A..J
+    # Datetime | ChatID | UserID | Username | FullName | MessageID | Text | Status | ErrorText | Source
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [
-        now_str,                         # A Datetime
-        str(chat_id or ""),              # B ChatID
-        str(user_id or ""),              # C UserID
-        str(username or ""),             # D Username
-        str(full_name or ""),            # E FullName
-        str(message_id or ""),           # F MessageID
-        str(text or ""),                 # G Text
-        str(status or ""),               # H Status
-        str(error_text or ""),           # I ErrorText
-        "TELEGRAM",                      # J Source
-        str(ops_row_num or ""),          # K OpsRow (номер строки в ОПЕРАЦИИ)
+        now_str,
+        str(chat_id or ""),
+        str(user_id or ""),
+        str(username or ""),
+        str(full_name or ""),
+        str(message_id or ""),
+        str(text or ""),
+        str(status or ""),
+        str(error_text or ""),
+        "TELEGRAM",
     ]
     try:
         append_row(SHEET_LOGS, row)
     except Exception as e:
-        print("log_action error:", repr(e))
+        print("log_event error:", repr(e))
 
 
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+def get_last_written_message_id_from_logs(chat_id: int) -> str | None:
+    rows = read_sheet_rows(SHEET_LOGS, "A:J")
+    if not rows:
+        return None
+
+    # B ChatID index 1, F MessageID index 5, H Status index 7
+    for r in reversed(rows):
+        try:
+            r_chat = str(r[1]).strip() if len(r) > 1 else ""
+            r_mid = str(r[5]).strip() if len(r) > 5 else ""
+            r_status = str(r[7]).strip() if len(r) > 7 else ""
+            if r_chat == str(chat_id) and r_mid and r_status == "OP_WRITE OK":
+                return r_mid
+        except:
+            continue
+    return None
 
 
+def find_row_by_message_id_in_ops(target_message_id: str) -> int | None:
+    if not target_message_id:
+        return None
+    col_m = read_column(SHEET_OPS, "M:M")  # MessageID column
+    if not col_m:
+        return None
+    for idx in range(len(col_m) - 1, -1, -1):
+        if str(col_m[idx]).strip() == str(target_message_id).strip():
+            return idx + 1
+    return None
+
+
+# =========================
+# VALIDATION (быстрый ввод через ;)
+# =========================
 def validate_and_parse(text: str):
     # ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТАРИЙ
     parts = [p.strip() for p in (text or "").split(";")]
     if len(parts) != 9:
         return None, (
-            "❌ Ошибка формата: должно быть 9 полей через ;\n"
+            "❌ Формат: 9 полей через ;\n"
             "Пример:\n"
-            "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; тест"
+            "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий"
         )
 
     object_, type_, article, amount_raw, pay_type, vat, period_raw, employee, comment = parts
 
-    if not object_ or not type_ or not article or not amount_raw:
-        return None, "❌ Не хватает обязательных полей: ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА"
+    # object
+    if object_ not in OBJECTS:
+        return None, "❌ Объект только из списка. Используй /new (кнопки) или напиши как в справочнике."
 
-    # Типы: РАСХОД, ЗП, АВАНС, ДОХОД
-    type_up = type_.strip().upper()
-    allowed_types = {"РАСХОД", "ЗП", "АВАНС", "ДОХОД"}
-    if type_up not in allowed_types:
-        return None, "❌ Тип должен быть: РАСХОД / ЗП / АВАНС / ДОХОД"
+    # type
+    type_up = type_.upper()
+    if type_up not in TYPES:
+        return None, "❌ Тип только: РАСХОД / ЗП / АВАНС / ДОХОД"
 
-    # Сумма
+    # article
+    if article not in ARTICLES:
+        return None, "❌ Статья только из списка. Используй /new (кнопки) или напиши как в справочнике."
+
+    # amount
     try:
         amt = amount_raw.replace(" ", "").replace(",", ".")
         amount = float(amt)
         if amount <= 0:
-            return None, "❌ Сумма должна быть больше 0"
+            return None, "❌ Сумма должна быть > 0"
     except:
         return None, "❌ Сумма должна быть числом"
 
-    # НДС
-    vat_up = vat.strip().upper()
-    if vat_up not in ("ДА", "НЕТ"):
+    # pay_type
+    if pay_type not in PAY_TYPES:
+        return None, "❌ Способ оплаты только: НАЛ / БЕЗНАЛ / ЗП_ОФИЦ / АВАНС / ПРЕДОПЛАТА"
+
+    # vat
+    vat_up = vat.upper()
+    if vat_up not in VAT_VALUES:
         return None, "❌ НДС только ДА или НЕТ"
 
-    # Период: YYYY-MM-1 или YYYY-MM-2 (это НЕ дата)
+    # period
+    period_raw = period_raw.strip()
     if not re.match(r"^\d{4}-\d{2}-[12]$", period_raw):
-        return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
-    # доп. проверка месяца 01..12
-    try:
-        mm = int(period_raw[5:7])
-        if mm < 1 or mm > 12:
-            return None, "❌ Месяц в периоде должен быть 01..12"
-    except:
-        return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
+        return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2 (пример: 2026-01-1)"
+
+    # employee
+    if not employee.strip():
+        return None, "❌ Сотрудник не должен быть пустым"
 
     return {
         "object": object_,
@@ -238,54 +339,106 @@ def validate_and_parse(text: str):
         "pay_type": pay_type,
         "vat": vat_up,
         "period": period_raw,
-        "employee": employee,
-        "comment": comment,
+        "employee": employee.strip(),
+        "comment": comment.strip(),
     }, None
 
 
-def find_last_ok_op_for_chat(chat_id: int) -> dict | None:
-    """
-    Finds last LOGS row where:
-    - ChatID matches
-    - Status == OK
-    - Text is not command
-    - OpsRow exists
-    Returns dict with ops_row, message_id
-    """
-    rows = read_last_logs(limit=400)
-
-    # Expected LOGS columns:
-    # A Datetime | B ChatID | C UserID | D Username | E FullName | F MessageID | G Text | H Status | I ErrorText | J Source | K OpsRow
-    for r in reversed(rows):
-        try:
-            if len(r) < 11:
-                continue
-            r_chat = r[1]
-            r_msgid = r[5] if len(r) > 5 else ""
-            r_text = r[6] if len(r) > 6 else ""
-            r_status = r[7] if len(r) > 7 else ""
-            r_opsrow = r[10] if len(r) > 10 else ""
-
-            if str(r_chat) != str(chat_id):
-                continue
-            if (r_status or "").upper() != "OK":
-                continue
-            if (r_text or "").strip().startswith("/"):
-                continue
-            if not str(r_opsrow).strip():
-                continue
-
-            return {
-                "ops_row": int(str(r_opsrow).strip()),
-                "message_id": str(r_msgid or "").strip(),
-                "text": str(r_text or "").strip(),
-            }
-        except Exception:
-            continue
-
-    return None
+# =========================
+# /new FLOW
+# =========================
+def _newflow_get(chat_id: int):
+    st = _new_flow.get(chat_id)
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > NEW_FLOW_TTL:
+        _new_flow.pop(chat_id, None)
+        return None
+    return st
 
 
+def _newflow_set(chat_id: int, step: int, data: dict):
+    _new_flow[chat_id] = {"step": step, "data": data, "ts": time.time()}
+
+
+def _newflow_clear(chat_id: int):
+    _new_flow.pop(chat_id, None)
+
+
+def _ask_step(chat_id: int, step: int):
+    if step == 1:
+        send_message(chat_id, "Шаг 1/9: Выбери объект:", kb([
+            ["ОКТЯБРЬСКИЙ", "ОБУХОВО", "ОДИНЦОВО"],
+            ["ЭКИПАЖ", "24 СКЛАД", "ЯРЦЕВО"],
+            ["ОБЩЕХОЗ"],
+            ["/cancel"]
+        ]))
+    elif step == 2:
+        send_message(chat_id, "Шаг 2/9: Выбери тип:", kb([
+            ["РАСХОД", "ЗП"],
+            ["АВАНС", "ДОХОД"],
+            ["/back", "/cancel"]
+        ]))
+    elif step == 3:
+        rows = []
+        row = []
+        for a in ARTICLES:
+            row.append(a)
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append(["/back", "/cancel"])
+        send_message(chat_id, "Шаг 3/9: Выбери статью:", kb(rows))
+    elif step == 4:
+        send_message(chat_id, "Шаг 4/9: Введи сумму (пример: 1000 или 10 000 или 1000,50):", kb([["/back", "/cancel"]]))
+    elif step == 5:
+        send_message(chat_id, "Шаг 5/9: Выбери способ оплаты:", kb([
+            ["НАЛ", "БЕЗНАЛ"],
+            ["ЗП_ОФИЦ", "АВАНС"],
+            ["ПРЕДОПЛАТА"],
+            ["/back", "/cancel"]
+        ]))
+    elif step == 6:
+        send_message(chat_id, "Шаг 6/9: НДС?", kb([["ДА", "НЕТ"], ["/back", "/cancel"]]))
+    elif step == 7:
+        send_message(
+            chat_id,
+            "Шаг 7/9: Период (YYYY-MM-1 или YYYY-MM-2)\n1=1–15, 2=16–31\nПример: 2026-01-1",
+            kb([["2026-01-1", "2026-01-2"], ["/back", "/cancel"]])
+        )
+    elif step == 8:
+        send_message(chat_id, "Шаг 8/9: Введи сотрудника (например: ИВАНОВ):", kb([["/back", "/cancel"]]))
+    elif step == 9:
+        send_message(chat_id, "Шаг 9/9: Комментарий (можно “-”):", kb([["/back", "/cancel"]]))
+
+
+def _write_operation(parsed: dict, message_id: int | None):
+    # ОПЕРАЦИИ: A..N (N = Комментарий)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [
+        now_str,                 # A DateTime
+        parsed["object"],        # B Объект
+        parsed["type"],          # C Тип
+        parsed["article"],       # D Статья
+        parsed["amount"],        # E СуммаБаза
+        parsed["pay_type"],      # F СпособОплаты
+        parsed["vat"],           # G НДС
+        "",                      # H Категория
+        parsed["period"],        # I ПЕРИОД
+        parsed["employee"],      # J Сотрудник
+        "",                      # K Статус
+        "TELEGRAM",              # L Источник
+        str(message_id or ""),   # M MessageID
+        parsed["comment"],       # N Комментарий
+    ]
+    append_row(SHEET_OPS, row)
+
+
+# =========================
+# ROUTES
+# =========================
 @app.get("/")
 def index():
     return "ok", 200
@@ -294,7 +447,6 @@ def index():
 @app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True) or {}
-
     msg = data.get("message") or data.get("edited_message")
     if not msg:
         return "no message", 200
@@ -308,105 +460,235 @@ def webhook():
 
     user_id = from_user.get("id")
     username = from_user.get("username", "")
-    full_name = " ".join([from_user.get("first_name", ""), from_user.get("last_name", "")]).strip()
+    full_name = (" ".join([from_user.get("first_name", ""), from_user.get("last_name", "")])).strip()
 
     message_id = msg.get("message_id")
     text = (msg.get("text") or "").strip()
 
-    # /start
+    # ---------- /start ----------
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий\n\n"
-            "Типы: РАСХОД / ЗП / АВАНС / ДОХОД\n"
-            "Команды: /undo",
+            "Привет!\n\n"
+            "✅ Быстрый ввод (1 строка):\n"
+            "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий\n\n"
+            "✅ Пошаговый ввод: /new\n"
+            "Отмена: /cancel\n"
+            "Назад: /back\n"
+            "Откат: /undo"
         )
-        log_action(chat_id, user_id, username, full_name, message_id, text, "OK", "", "START")
+        log_event(chat_id, user_id, username, full_name, message_id, text, "START OK")
         return "ok", 200
 
+    # ---------- /new /cancel ----------
+    if text.strip() == "/new":
+        _newflow_set(chat_id, 1, {})
+        send_message(chat_id, "🧾 Пошаговый ввод. Отвечай по шагам. /cancel — отмена.", kb([["/cancel"]]))
+        _ask_step(chat_id, 1)
+        log_event(chat_id, user_id, username, full_name, message_id, text, "NEW START")
+        return "ok", 200
+
+    if text.strip() == "/cancel":
+        _newflow_clear(chat_id)
+        send_message(chat_id, "❎ Ок, отменил ввод.", kb([["/new"], ["/undo"]]))
+        log_event(chat_id, user_id, username, full_name, message_id, text, "NEW CANCEL")
+        return "ok", 200
+
+    # ---------- /undo ----------
+    if text.strip().lower() == "/undo":
+        try:
+            target_mid = get_last_written_message_id_from_logs(chat_id)
+            if not target_mid:
+                send_message(chat_id, "⚠️ Нечего отменять (в логах нет последней операции).")
+                log_event(chat_id, user_id, username, full_name, message_id, text, "UNDO WARN", "no last op")
+                return "ok", 200
+
+            row_num = find_row_by_message_id_in_ops(target_mid)
+            if not row_num:
+                send_message(chat_id, "⚠️ Не нашёл строку в ОПЕРАЦИИ для отмены (MessageID не найден).")
+                log_event(chat_id, user_id, username, full_name, message_id, text, "UNDO WARN", f"mid not found: {target_mid}")
+                return "ok", 200
+
+            delete_row(SHEET_OPS, row_num)
+            send_message(chat_id, f"✅ Отменил последнюю операцию (удалил строку {row_num}).")
+            log_event(chat_id, user_id, username, full_name, message_id, text, "UNDO OK", f"deleted row {row_num} mid={target_mid}")
+            return "ok", 200
+
+        except Exception as e:
+            print("UNDO error:", repr(e))
+            send_message(chat_id, f"❌ Ошибка /undo: {e}")
+            log_event(chat_id, user_id, username, full_name, message_id, text, "UNDO ERR", str(e))
+            return "ok", 200
+
+    # ---------- Anti-dup ----------
     now_ts = time.time()
     _cleanup_caches(now_ts)
 
-    # --- Anti-dup by MessageID ---
+    # MessageID dedup (молча, чтобы не спамить)
     if message_id is not None:
         if message_id in _seen_message_ids:
-            send_message(chat_id, "⚠️ Повтор (MessageID). Не записал.")
-            log_action(chat_id, user_id, username, full_name, message_id, text, "DUP_ID", "", "DEDUP")
+            log_event(chat_id, user_id, username, full_name, message_id, text, "DEDUP MESSAGE_ID")
             return "dup message_id", 200
         _seen_message_ids[message_id] = now_ts
 
-    # --- Anti-dup by content within window (per chat) ---
+    # Content dedup (с уведомлением)
     norm_text = normalize_text(text)
     if norm_text:
         key = (chat_id, norm_text)
         last_ts = _seen_content.get(key)
         if last_ts and (now_ts - last_ts) <= CONTENT_DEDUP_WINDOW_SECONDS:
             send_message(chat_id, "⚠️ Повтор (текст). Не записал.")
-            log_action(chat_id, user_id, username, full_name, message_id, text, "DUP_TEXT", "", "DEDUP")
+            log_event(chat_id, user_id, username, full_name, message_id, text, "DEDUP TEXT")
             return "dup content", 200
         _seen_content[key] = now_ts
 
-    # /undo
-    if norm_text == "/undo":
-        try:
-            last = find_last_ok_op_for_chat(chat_id)
-            if not last:
-                send_message(chat_id, "⚠️ Нет последней операции для отмены (в логах не найдено).")
-                log_action(chat_id, user_id, username, full_name, message_id, text, "WARN", "no last op", "UNDO")
+    # ---------- /new flow processing ----------
+    st = _newflow_get(chat_id)
+    if st:
+        step = st["step"]
+        data_nf = st["data"]
+
+        if text.strip() == "/back":
+            step = max(1, step - 1)
+            _newflow_set(chat_id, step, data_nf)
+            _ask_step(chat_id, step)
+            return "ok", 200
+
+        # STEP 1 object
+        if step == 1:
+            if text not in OBJECTS:
+                send_message(chat_id, "❌ Выбери объект кнопкой.")
+                _ask_step(chat_id, 1)
                 return "ok", 200
-
-            ops_row = last["ops_row"]
-            delete_row(SHEET_OPS, ops_row)
-
-            send_message(chat_id, f"✅ Отменил последнюю операцию (удалил строку {ops_row}).")
-            log_action(chat_id, user_id, username, full_name, message_id, text, "OK", "", "UNDO", ops_row_num=ops_row)
+            data_nf["object"] = text
+            _newflow_set(chat_id, 2, data_nf)
+            _ask_step(chat_id, 2)
             return "ok", 200
 
-        except Exception as e:
-            print("undo error:", repr(e))
-            send_message(chat_id, f"❌ Ошибка /undo: {e}")
-            log_action(chat_id, user_id, username, full_name, message_id, text, "BAD", str(e), "UNDO")
+        # STEP 2 type
+        if step == 2:
+            if text not in TYPES:
+                send_message(chat_id, "❌ Выбери тип кнопкой.")
+                _ask_step(chat_id, 2)
+                return "ok", 200
+            data_nf["type"] = text
+            _newflow_set(chat_id, 3, data_nf)
+            _ask_step(chat_id, 3)
             return "ok", 200
 
+        # STEP 3 article
+        if step == 3:
+            if text not in ARTICLES:
+                send_message(chat_id, "❌ Выбери статью кнопкой.")
+                _ask_step(chat_id, 3)
+                return "ok", 200
+            data_nf["article"] = text
+            _newflow_set(chat_id, 4, data_nf)
+            _ask_step(chat_id, 4)
+            return "ok", 200
+
+        # STEP 4 amount
+        if step == 4:
+            try:
+                amt = text.replace(" ", "").replace(",", ".")
+                amount = float(amt)
+                if amount <= 0:
+                    raise ValueError()
+            except:
+                send_message(chat_id, "❌ Сумма должна быть числом > 0. Пример: 1000 или 1000,50")
+                _ask_step(chat_id, 4)
+                return "ok", 200
+            data_nf["amount"] = amount
+            _newflow_set(chat_id, 5, data_nf)
+            _ask_step(chat_id, 5)
+            return "ok", 200
+
+        # STEP 5 pay_type
+        if step == 5:
+            if text not in PAY_TYPES:
+                send_message(chat_id, "❌ Выбери способ оплаты кнопкой.")
+                _ask_step(chat_id, 5)
+                return "ok", 200
+            data_nf["pay_type"] = text
+            _newflow_set(chat_id, 6, data_nf)
+            _ask_step(chat_id, 6)
+            return "ok", 200
+
+        # STEP 6 vat
+        if step == 6:
+            if text not in VAT_VALUES:
+                send_message(chat_id, "❌ НДС только ДА или НЕТ.")
+                _ask_step(chat_id, 6)
+                return "ok", 200
+            data_nf["vat"] = text
+            _newflow_set(chat_id, 7, data_nf)
+            _ask_step(chat_id, 7)
+            return "ok", 200
+
+        # STEP 7 period
+        if step == 7:
+            if not re.match(r"^\d{4}-\d{2}-[12]$", text.strip()):
+                send_message(chat_id, "❌ Период только YYYY-MM-1 или YYYY-MM-2 (пример: 2026-01-1)")
+                _ask_step(chat_id, 7)
+                return "ok", 200
+            data_nf["period"] = text.strip()
+            _newflow_set(chat_id, 8, data_nf)
+            _ask_step(chat_id, 8)
+            return "ok", 200
+
+        # STEP 8 employee
+        if step == 8:
+            if not text.strip():
+                send_message(chat_id, "❌ Сотрудник не должен быть пустым.")
+                _ask_step(chat_id, 8)
+                return "ok", 200
+            data_nf["employee"] = text.strip()
+            _newflow_set(chat_id, 9, data_nf)
+            _ask_step(chat_id, 9)
+            return "ok", 200
+
+        # STEP 9 comment + write
+        if step == 9:
+            data_nf["comment"] = text.strip() if text.strip() else "-"
+
+            try:
+                parsed = {
+                    "object": data_nf["object"],
+                    "type": data_nf["type"],
+                    "article": data_nf["article"],
+                    "amount": data_nf["amount"],
+                    "pay_type": data_nf["pay_type"],
+                    "vat": data_nf["vat"],
+                    "period": data_nf["period"],
+                    "employee": data_nf["employee"],
+                    "comment": data_nf["comment"],
+                }
+                _write_operation(parsed, message_id)
+                send_message(chat_id, "✅ Записал")
+                log_event(chat_id, user_id, username, full_name, message_id, f"/new {parsed}", "OP_WRITE OK")
+            except Exception as e:
+                print("append error:", repr(e))
+                send_message(chat_id, f"❌ Ошибка записи: {e}")
+                log_event(chat_id, user_id, username, full_name, message_id, text, "OP_WRITE ERR", str(e))
+
+            _newflow_clear(chat_id)
+            return "ok", 200
+
+    # ---------- fast input (;) ----------
     parsed, err = validate_and_parse(text)
     if err:
         send_message(chat_id, err)
-        log_action(chat_id, user_id, username, full_name, message_id, text, "BAD", err, "VALIDATE")
+        log_event(chat_id, user_id, username, full_name, message_id, text, "VALIDATE BAD", err)
         return "bad format", 200
 
     try:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        row = [
-            now_str,                 # A DateTime
-            parsed["object"],        # B Объект
-            parsed["type"],          # C Тип (РАСХОД/ЗП/АВАНС/ДОХОД)
-            parsed["article"],       # D Статья
-            parsed["amount"],        # E СуммаБаза
-            parsed["pay_type"],      # F СпособОплаты
-            parsed["vat"],           # G НДС
-            "",                      # H Категория (пусто)
-            parsed["period"],        # I ПЕРИОД (YYYY-MM-1/2)
-            parsed["employee"],      # J Сотрудник
-            "",                      # K Статус (пусто)
-            "TELEGRAM",              # L Источник
-            str(message_id or ""),   # M MessageID
-            parsed["comment"],       # N Комментарий (если у вас есть этот столбец; если нет — убери строку)
-        ]
-
-        ops_row_num, updated_range = append_row(SHEET_OPS, row)
-
+        _write_operation(parsed, message_id)
         send_message(chat_id, "✅ Записал")
-        log_action(
-            chat_id, user_id, username, full_name, message_id, text,
-            "OK", "", "OP_WRITE",
-            ops_row_num=ops_row_num
-        )
-
+        log_event(chat_id, user_id, username, full_name, message_id, text, "OP_WRITE OK")
     except Exception as e:
         print("append error:", repr(e))
-        send_message(chat_id, f"❌ Ошибка записи в таблицу: {e}")
-        log_action(chat_id, user_id, username, full_name, message_id, text, "BAD", str(e), "OP_WRITE")
+        send_message(chat_id, f"❌ Ошибка записи: {e}")
+        log_event(chat_id, user_id, username, full_name, message_id, text, "OP_WRITE ERR", str(e))
 
     return "ok", 200
 

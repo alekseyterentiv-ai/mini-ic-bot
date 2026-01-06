@@ -158,6 +158,7 @@ def webhook():
             "",             # K Статус
             "TELEGRAM",     # L Источник
             message_id,     # M MessageID
+            comment,        # N Комментарий
         ]
 
         updated_rows = append_row(row)

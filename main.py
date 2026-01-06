@@ -26,18 +26,16 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEDUP_TTL_SECONDS = 6 * 60 * 60          # MessageID защита (6 часов)
 CONTENT_DEDUP_WINDOW_SECONDS = 30        # окно антидубля по тексту
 
-# In-memory caches (Cloud Run может перезапускать/масштабировать — это ок для базовой защиты)
+# In-memory caches
 _seen_message_ids = {}        # message_id -> ts
 _seen_content = {}            # (chat_id, normalized_text) -> ts
 
 
 def _cleanup_caches(now_ts: float) -> None:
-    # чистим message_id
     to_del = [k for k, ts in _seen_message_ids.items() if now_ts - ts > DEDUP_TTL_SECONDS]
     for k in to_del:
         _seen_message_ids.pop(k, None)
 
-    # чистим контент
     to_del = [k for k, ts in _seen_content.items() if now_ts - ts > CONTENT_DEDUP_WINDOW_SECONDS]
     for k in to_del:
         _seen_content.pop(k, None)
@@ -64,10 +62,9 @@ def build_sheets_service():
 
 
 def append_row_with_service(service, sheet_name: str, row: list):
-    # ВАЖНО: range = только имя листа (без !A)
     service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=sheet_name,
+        range=sheet_name,  # только имя листа
         valueInputOption="USER_ENTERED",
         body={"values": [row]},
     ).execute()
@@ -103,13 +100,10 @@ def log_action(service, now_str: str, chat_id, user_id, username, full_name,
         ]
         append_row_with_service(service, SHEET_LOGS, row)
     except Exception as e:
-        # логи не должны ломать основную работу
         print("log_action error:", repr(e))
 
 
 def validate_and_parse(text: str):
-    # ожидаем: 9 полей
-    # ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТАРИЙ
     parts = [p.strip() for p in text.split(";")]
 
     if len(parts) != 9:
@@ -124,12 +118,10 @@ def validate_and_parse(text: str):
     if not object_ or not type_ or not article or not amount_raw:
         return None, "❌ Не хватает обязательных полей: ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА"
 
-    # Тип
     type_up = type_.upper()
     if type_up not in ("РАСХОД", "ПРИХОД"):
         return None, "❌ Тип должен быть РАСХОД или ПРИХОД"
 
-    # Сумма
     try:
         amt = amount_raw.replace(" ", "").replace(",", ".")
         amount = float(amt)
@@ -138,16 +130,12 @@ def validate_and_parse(text: str):
     except:
         return None, "❌ Сумма должна быть числом"
 
-    # НДС
     vat_up = vat.upper()
     if vat_up not in ("ДА", "НЕТ"):
         return None, "❌ НДС только ДА или НЕТ"
 
-    # Период: YYYY-MM-1 или YYYY-MM-2 (это НЕ дата)
     if not re.match(r"^\d{4}-\d{2}-[12]$", period_raw):
         return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
-
-    period = period_raw
 
     return {
         "object": object_,
@@ -156,12 +144,120 @@ def validate_and_parse(text: str):
         "amount": amount,
         "pay_type": pay_type,
         "vat": vat_up,
-        "period": period,
+        "period": period_raw,
         "employee": employee,
         "comment": comment,
     }, None
 
 
+# ---------------- /undo helpers ----------------
+def get_sheet_id(service, sheet_name: str):
+    meta = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    for sh in meta.get("sheets", []):
+        props = sh.get("properties", {})
+        if props.get("title") == sheet_name:
+            return props.get("sheetId")
+    return None
+
+
+def find_last_ok_message_id_in_logs(service, chat_id: int, user_id: int, max_rows=2000):
+    """
+    Ищем последнюю запись OK в ЛОГИ для этого chat_id + user_id,
+    где Text НЕ /undo (чтобы undo не отменял сам себя).
+    Возвращаем message_id (как строку) или None.
+    """
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_LOGS}!A:J"
+    ).execute()
+
+    rows = resp.get("values", [])
+    if not rows:
+        return None
+
+    tail = rows[-max_rows:] if len(rows) > max_rows else rows
+
+    for r in reversed(tail):
+        # ожидаем A..J
+        r_chat = r[1] if len(r) > 1 else ""
+        r_user = r[2] if len(r) > 2 else ""
+        r_mid = r[5] if len(r) > 5 else ""
+        r_text = r[6] if len(r) > 6 else ""
+        r_status = r[7] if len(r) > 7 else ""
+
+        if str(r_chat) != str(chat_id):
+            continue
+        if str(r_user) != str(user_id):
+            continue
+        if str(r_status).strip().upper() != "OK":
+            continue
+        if str(r_text).strip().lower().startswith("/undo"):
+            continue
+        if not str(r_mid).strip():
+            continue
+
+        return str(r_mid).strip()
+
+    return None
+
+
+def find_row_index_by_message_id_in_ops(service, message_id: str, max_rows=3000):
+    """
+    Ищем строку в ОПЕРАЦИИ по колонке M (MessageID).
+    Возвращаем (rowIndex0Based) для batchUpdate deleteDimension.
+    """
+    resp = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_OPS}!A:M"
+    ).execute()
+
+    rows = resp.get("values", [])
+    if not rows:
+        return None
+
+    # rows: list of rows, each row is list of cell values
+    # В Google Sheets индексация строк в batchUpdate: 0-based, endIndex is exclusive
+    # range A:M includes header row if it exists. Нам нужна реальная позиция строки.
+    tail = rows[-max_rows:] if len(rows) > max_rows else rows
+    base_offset = len(rows) - len(tail)  # сколько строк отрезали слева
+
+    for i in range(len(tail) - 1, -1, -1):
+        r = tail[i]
+        mid = r[12] if len(r) > 12 else ""  # M column index 12
+        if str(mid).strip() == str(message_id).strip():
+            # row number in full "rows" list (0-based)
+            full_row_idx = base_offset + i
+            return full_row_idx
+
+    return None
+
+
+def delete_row(service, sheet_name: str, row_index_0based: int):
+    sid = get_sheet_id(service, sheet_name)
+    if sid is None:
+        raise RuntimeError(f"Не найден лист: {sheet_name}")
+
+    req = {
+        "requests": [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sid,
+                        "dimension": "ROWS",
+                        "startIndex": row_index_0based,
+                        "endIndex": row_index_0based + 1
+                    }
+                }
+            }
+        ]
+    }
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body=req
+    ).execute()
+
+
+# ---------------- routes ----------------
 @app.get("/")
 def index():
     return "ok", 200
@@ -190,28 +286,53 @@ def webhook():
     now_ts = time.time()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Поднимаем сервис один раз на запрос (и для операций, и для логов)
-    service = None
+    # Sheets service
     try:
         service = build_sheets_service()
     except Exception as e:
-        # даже если Sheets упал — отвечаем, и лог локально в консоль
         print("build_sheets_service error:", repr(e))
         send_message(chat_id, "❌ Ошибка доступа к Google Sheets (проверь GOOGLE_SA_JSON/доступ к таблице).")
         return "ok", 200
 
-    # /start
+    # ---------- /start ----------
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий",
+            "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий\n\nКоманды:\n/undo — отменить последнюю запись"
         )
         log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "INFO", "/start")
         return "ok", 200
 
+    # ---------- /undo ----------
+    if text.strip().lower().startswith("/undo"):
+        try:
+            last_mid = find_last_ok_message_id_in_logs(service, chat_id, user_id)
+            if not last_mid:
+                send_message(chat_id, "⚠️ Нечего отменять: нет предыдущих успешных записей.")
+                log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "ERROR", "undo: no OK logs")
+                return "ok", 200
+
+            row_idx = find_row_index_by_message_id_in_ops(service, last_mid)
+            if row_idx is None:
+                send_message(chat_id, "⚠️ Не нашёл строку в ОПЕРАЦИИ для отмены (MessageID не найден).")
+                log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "ERROR", f"undo: ops row not found for mid={last_mid}")
+                return "ok", 200
+
+            delete_row(service, SHEET_OPS, row_idx)
+            send_message(chat_id, "✅ Отменил последнюю запись.")
+            log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "OK", f"undo: deleted mid={last_mid}")
+            return "ok", 200
+
+        except Exception as e:
+            print("undo error:", repr(e))
+            send_message(chat_id, f"❌ Ошибка /undo: {e}")
+            log_action(service, now_str, chat_id, user_id, username, full_name, message_id, text, "ERROR", f"undo: {e}")
+            return "ok", 200
+
+    # ---------- normal flow ----------
     _cleanup_caches(now_ts)
 
-    # --- Anti-dup by MessageID ---
+    # Anti-dup by MessageID
     if message_id is not None:
         if message_id in _seen_message_ids:
             send_message(chat_id, "⚠️ Дубль (message_id). Уже обработано.")
@@ -219,7 +340,7 @@ def webhook():
             return "dup message_id", 200
         _seen_message_ids[message_id] = now_ts
 
-    # --- Anti-dup by content within 30s (per chat) ---
+    # Anti-dup by content within 30s (per chat)
     norm_text = re.sub(r"\s+", " ", text).strip().lower()
     key = (chat_id, norm_text)
     if norm_text:

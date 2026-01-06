@@ -104,23 +104,21 @@ def parse_message_to_row(text: str):
     comment = parts[8]
 
     # Datetime в 1-й колонке
-  now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-row = [
-    now,          # A DateTime
-    object_,      # B Объект
-    type_,        # C Тип
-    article,      # D Статья
-    amount,       # E СуммаБаза
-    pay_type,     # F СпособОплаты
-    vat,          # G НДС
-    "",           # H Категория (пока пусто, потом подтянем автоматически)
-    period,       # I ПЕРИОД
-    employee,     # J Сотрудник
-    "",           # K Статус (пока пусто)
-    "TELEGRAM",   # L Источник
-    str(message_id),  # M MessageID
-]
+    row = [
+        now,        # A Datetime
+        object_,    # B Объект
+        type_,      # C Тип
+        article,    # D Статья
+        amount,     # E Сумма
+        pay_type,   # F Способ оплаты
+        vat,        # G НДС
+        period,     # H Период
+        employee,   # I Сотрудник
+        comment,    # J Комментарий
+        "TELEGRAM", # K Источник
+    ]
     return row, None
 
 

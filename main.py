@@ -1,24 +1,26 @@
+from flask import Flask, request
 import os
 import json
 import requests
 from datetime import datetime
 
-from flask import Flask, request
-
-from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-# ===== ENV =====
+# --- ENV ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
-SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ").strip()
+TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
-# GOOGLE_SA_JSON должен быть именно JSON-строкой сервисного аккаунта (секрет, выведенный как env var)
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
+SHEET_OPS = os.environ.get("SHEET_OPS", "").strip()  # например: ОПЕРАЦИИ
+
+# Секрет из Secret Manager, "exposed as environment variable"
+# В Cloud Run это должна быть переменная окружения GOOGLE_SA_JSON, содержащая ВЕСЬ JSON сервис-аккаунта.
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 
-TG_API = f"https://api.telegram.org/bot{TOKEN}"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 @app.get("/")
@@ -30,101 +32,75 @@ def send_message(chat_id: int, text: str):
     if not TOKEN:
         print("ERROR: TELEGRAM_TOKEN is not set")
         return
-    try:
-        r = requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=10
-        )
-        print("sendMessage:", r.status_code, r.text)
-    except Exception as e:
-        print("sendMessage exception:", str(e))
+    r = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=15
+    )
+    print("sendMessage:", r.status_code, r.text)
 
 
 def get_sheets_service():
     if not GOOGLE_SA_JSON:
-        raise RuntimeError("GOOGLE_SA_JSON is not set")
+        raise RuntimeError("GOOGLE_SA_JSON is not set (Secret Manager env var is missing)")
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID is not set")
+    if not SHEET_OPS:
+        raise RuntimeError("SHEET_OPS is not set (sheet name)")
 
     info = json.loads(GOOGLE_SA_JSON)
-
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def append_row(row: list):
-    if not SPREADSHEET_ID:
-        raise RuntimeError("SPREADSHEET_ID is not set")
-    if not SHEET_OPS:
-        raise RuntimeError("SHEET_OPS is not set")
-
     service = get_sheets_service()
 
-    # КЛЮЧЕВОЕ: range = ТОЛЬКО имя листа, без !A
+    # ✅ САМЫЙ СТАБИЛЬНЫЙ ВАРИАНТ: range = только имя листа (без "!A")
     res = service.spreadsheets().values().append(
         spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_OPS,
+        range=SHEET_OPS,  # например "ОПЕРАЦИИ"
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
-        body={"values": [row]},
+        body={"values": [row]}
     ).execute()
 
-    updates = (res.get("updates") or {}).get("updatedRows", 0)
-    return updates
+    updates = res.get("updates", {})
+    return updates.get("updatedRows", 1)
 
 
 def parse_line(text: str):
     """
-    Ожидаем 9 полей:
-    object_; type_; article; amount; pay_type; vat; period; employee; comment
+    Формат:
+    ОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё
 
-    Разделители: ';' или ':'
+    Разделитель: ;
+    Пустые поля допускаются.
     """
-    raw = (text or "").strip()
+    parts = [p.strip() for p in text.split(";")]
 
-    # разрешаем и ; и :
-    sep = ";" if ";" in raw else ":"
-    parts = [p.strip() for p in raw.split(sep)]
-
-    # убираем пустые хвосты (если человек наделал ";;;")
-    while parts and parts[-1] == "":
-        parts.pop()
-
-    if len(parts) < 4:
-        return None, "Мало полей. Формат:\nОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ"
-
-    # добиваем до 9 элементов пустыми
+    # добьём до 9 полей (comment может отсутствовать)
     while len(parts) < 9:
         parts.append("")
 
     object_ = parts[0]
     type_ = parts[1]
     article = parts[2]
-
-    # сумма
-    amount_raw = parts[3].replace(" ", "").replace(",", ".")
-    try:
-        amount = float(amount_raw)
-    except Exception:
-        return None, f"Сумма не число: '{parts[3]}'"
-
+    amount_raw = parts[3]
     pay_type = parts[4]
-    vat = parts[5]  # как строка: "ДА/НЕТ" или что ты вводишь
+    vat = parts[5]
     period = parts[6]
     employee = parts[7]
     comment = parts[8]
 
-    return {
-        "object_": object_,
-        "type_": type_,
-        "article": article,
-        "amount": amount,
-        "pay_type": pay_type,
-        "vat": vat,
-        "period": period,
-        "employee": employee,
-        "comment": comment,
-    }, None
+    if not object_ or not type_ or not article or not amount_raw:
+        raise ValueError("Не хватает обязательных полей: объект; тип; статья; сумма")
+
+    # сумма: допускаем "10 000", "10000", "10000,50"
+    amt = amount_raw.replace(" ", "").replace(",", ".")
+    amount = float(amt)
+
+    return object_, type_, article, amount, pay_type, vat, period, employee, comment
 
 
 @app.post("/webhook")
@@ -132,63 +108,63 @@ def webhook():
     data = request.get_json(silent=True) or {}
     print("update:", json.dumps(data, ensure_ascii=False))
 
-    # берём message из разных типов апдейтов
-    msg = (
-        data.get("message")
-        or data.get("edited_message")
-        or data.get("channel_post")
-        or data.get("edited_channel_post")
-    )
+    msg = data.get("message") or data.get("edited_message")
     if not msg:
         return "ok", 200
 
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
+    chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
+    message_id = str(msg.get("message_id", ""))  # ✅ MessageID (колонка M)
 
-    # MessageID — должен приходить из Telegram
-    message_id = msg.get("message_id")
-    if message_id is None:
-        message_id = ""  # на всякий случай, но обычно он всегда есть
-
-    # /start (даже если человек прислал "/start\nчто-то")
+    # /start (или "/start что-то") — только подсказка, НЕ пишем в таблицу
     if text.startswith("/start"):
         send_message(
             chat_id,
-            "Привет! Я на связи.\n\nФормат:\nОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ\n\nПример:\nОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё"
+            "Привет! Я на связи.\n\nФормат:\n"
+            "ОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё"
         )
         return "ok", 200
 
-    # парсим строку
-    parsed, err = parse_line(text)
-    if err:
-        send_message(chat_id, f"Ошибка формата: {err}")
-        return "ok", 200
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # ПОРЯДОК КОЛОНОК A..M (13 штук)
-    row = [
-        now,                      # A DateTime
-        parsed["object_"],        # B Объект
-        parsed["type_"],          # C Тип
-        parsed["article"],        # D Статья
-        parsed["amount"],         # E СуммаБаза
-        parsed["pay_type"],       # F СпособОплаты
-        parsed["vat"],            # G НДС
-        "",                       # H Категория (пусто)
-        parsed["period"],         # I ПЕРИОД
-        parsed["employee"],       # J Сотрудник
-        "",                       # K Статус (пусто)
-        "TELEGRAM",               # L Источник
-        message_id,               # M MessageID
-    ]
-
     try:
-        updated = append_row(row)
-        send_message(chat_id, f"Записал строк: {updated} (message_id={message_id})")
+        object_, type_, article, amount, pay_type, vat, period, employee, comment = parse_line(text)
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # ✅ Порядок колонок как ты писал:
+        # A Datetime
+        # B Объект
+        # C Тип
+        # D Статья
+        # E СуммаБаза
+        # F СпособОплаты
+        # G НДС
+        # H Категория (пусто)
+        # I ПЕРИОД
+        # J Сотрудник
+        # K Статус (пусто)
+        # L Источник
+        # M MessageID
+        row = [
+            now,            # A DateTime
+            object_,        # B Объект
+            type_,          # C Тип
+            article,        # D Статья
+            amount,         # E СуммаБаза
+            pay_type,       # F СпособОплаты
+            vat,            # G НДС
+            "",             # H Категория
+            period,         # I ПЕРИОД
+            employee,       # J Сотрудник
+            "",             # K Статус
+            "TELEGRAM",     # L Источник
+            message_id,     # M MessageID
+        ]
+
+        updated_rows = append_row(row)
+        send_message(chat_id, f"Записал строк: {updated_rows}")
+
     except Exception as e:
-        send_message(chat_id, f"Ошибка записи в таблицу: {str(e)}")
-        print("append error:", str(e))
+        send_message(chat_id, f"Ошибка записи в таблицу: {e}")
+        print("ERROR:", repr(e))
 
     return "ok", 200

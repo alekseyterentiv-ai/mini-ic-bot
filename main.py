@@ -1,80 +1,132 @@
 from flask import Flask, request
-import os, json, re
+import os
+import json
+import re
+from datetime import datetime
+
 import requests
-import gspread
-import google.auth
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# ===== ENV =====
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
-SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
-SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ")
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
+SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ").strip()
 
-_gc = None
-_ws_ops = None
+# Секрет из Secret Manager, проброшенный как env-переменная GOOGLE_SA_JSON
+GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 
-def sheets_ops():
-    global _gc, _ws_ops
-    if _ws_ops:
-        return _ws_ops
-    # Берём креды автоматически из Service Account Cloud Run
-    creds, _ = google.auth.default(scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ])
-    _gc = gspread.authorize(creds)
-    sh = _gc.open_by_key(SPREADSHEET_ID)
-    _ws_ops = sh.worksheet(SHEET_OPS)
-    return _ws_ops
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+# ===== Google Sheets client =====
+def get_sheets_service():
+    if not GOOGLE_SA_JSON:
+        raise RuntimeError("GOOGLE_SA_JSON is not set (Secret Manager -> env var).")
+
+    info = json.loads(GOOGLE_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def append_row(values: list):
+    if not SPREADSHEET_ID:
+        raise RuntimeError("SPREADSHEET_ID is not set.")
+    if not SHEET_OPS:
+        raise RuntimeError("SHEET_OPS is not set.")
+
+    service = get_sheets_service()
+    body = {"values": [values]}
+    # Пишем в лист (таб) SHEET_OPS, начиная с A
+    service.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SHEET_OPS}!A:K",
+        valueInputOption="USER_ENTERED",
+        insertDataOption="INSERT_ROWS",
+        body=body,
+    ).execute()
+
+
+# ===== Telegram helpers =====
+def send_message(chat_id: int, text: str):
+    if not TOKEN:
+        print("ERROR: TELEGRAM_TOKEN is not set")
+        return
+    r = requests.post(
+        f"{TG_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text},
+        timeout=20,
+    )
+    print("sendMessage:", r.status_code, r.text)
+
 
 @app.get("/")
 def index():
     return "OK", 200
 
-def send_message(chat_id: int, text: str):
-    r = requests.post(
-        f"{TG_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
-        timeout=10
-    )
-    print("sendMessage:", r.status_code, r.text)
 
-def parse_semicolon(text: str):
-    # ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ
+def parse_message_to_row(text: str):
+    """
+    Ожидаем формат:
+    ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ_ОПЛАТЫ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ
+    Пример:
+    ОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё
+    """
     parts = [p.strip() for p in text.split(";")]
-    if len(parts) < 4:
-        return None
-    # добиваем до 9 полей
-    while len(parts) < 9:
-        parts.append("")
-    obj, typ, article, amount_raw, pay, vat, period, employee, comment = parts[:9]
 
-    # сумма: "10 000", "10000", "5к"
-    amount_raw = amount_raw.replace("₽", "").replace(" ", "")
-    m = re.match(r"^(\d+(?:[.,]\d+)?)(к)?$", amount_raw, re.IGNORECASE)
-    if not m:
-        return None
-    amount = float(m.group(1).replace(",", "."))
-    if m.group(2):
-        amount *= 1000
+    if len(parts) < 9:
+        return None, (
+            "Формат не распознан.\n"
+            "Нужно 9 полей через `;`:\n"
+            "Объект; Тип; Статья; Сумма; Оплата; НДС(ДА/НЕТ); Период(YYYY-MM-DD); Сотрудник; Коммент"
+        )
 
-    return {
-        "object": obj.upper(),
-        "type": typ.upper(),
-        "article": article.upper(),
-        "amount": amount,
-        "pay": pay.upper() if pay else "",
-        "vat": vat.upper() if vat else "",
-        "period": period,
-        "employee": employee,
-        "comment": comment,
-    }
+    object_ = parts[0]
+    type_ = parts[1]
+    article = parts[2]
+
+    # сумма: допускаем пробелы/запятые
+    amount_raw = parts[3].replace(" ", "").replace(",", ".")
+    try:
+        amount = float(amount_raw)
+    except ValueError:
+        return None, "Сумма не число. Пример суммы: 10000 или 10000.50"
+
+    pay_type = parts[4]
+    vat = parts[5].upper()
+    period = parts[6]
+    employee = parts[7]
+    comment = parts[8]
+
+    # Datetime в 1-й колонке
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row = [
+        now,        # A Datetime
+        object_,    # B Объект
+        type_,      # C Тип
+        article,    # D Статья
+        amount,     # E Сумма
+        pay_type,   # F Способ оплаты
+        vat,        # G НДС
+        period,     # H Период
+        employee,   # I Сотрудник
+        comment,    # J Комментарий
+        "TELEGRAM", # K Источник
+    ]
+    return row, None
+
 
 @app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True) or {}
+    print("update:", json.dumps(data, ensure_ascii=False))
+
     msg = data.get("message") or data.get("edited_message")
     if not msg:
         return "ok", 200
@@ -83,38 +135,33 @@ def webhook():
     text = (msg.get("text") or "").strip()
 
     if text == "/start":
-        send_message(chat_id,
-            "Я на связи.\n"
-            "Формат ввода:\n"
-            "ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ\n"
+        send_message(
+            chat_id,
+            "Привет! Я на связи.\n"
+            "Отправь строку формата:\n"
+            "Объект; Тип; Статья; Сумма; Оплата; НДС; Период; Сотрудник; Коммент\n"
             "Пример:\n"
-            "ОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-1;; за жильё"
+            "ОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё",
         )
         return "ok", 200
 
-    p = parse_semicolon(text)
-    if not p:
-        send_message(chat_id, "Не понял формат. Напиши /start — покажу пример.")
-        return "ok", 200
+    # Если пользователь прислал несколько строк — пишем каждую
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    ok_count = 0
+    for ln in lines:
+        row, err = parse_message_to_row(ln)
+        if err:
+            send_message(chat_id, err)
+            continue
+        try:
+            append_row(row)
+            ok_count += 1
+        except Exception as e:
+            print("append error:", str(e))
+            send_message(chat_id, f"Ошибка записи в таблицу: {e}")
+            break
 
-    # Пишем строку в ОПЕРАЦИИ по твоей шапке:
-    # DateTime | Объект | Тип | Статья | СуммаБаза | СпособОплаты | НДС | Категория | ПЕРИОД | Сотрудник | Статус | Источник | MessageID
-    ws = sheets_ops()
-    ws.append_row([
-        "",                 # DateTime (можно оставить пусто — таблица/формулы сами поставят, или позже проставим)
-        p["object"],
-        p["type"],
-        p["article"],
-        p["amount"],
-        p["pay"],
-        p["vat"],
-        "",                 # Категория (пока пусто — позже подтянем из НАСТРОЙКИ)
-        p["period"],
-        p["employee"],
-        "",                 # Статус
-        "TELEGRAM",
-        str(msg.get("message_id", "")),
-    ], value_input_option="USER_ENTERED")
+    if ok_count:
+        send_message(chat_id, f"Записал строк: {ok_count}")
 
-    send_message(chat_id, f"Записал: {p['object']} / {p['type']} / {p['article']} / {p['amount']}")
     return "ok", 200

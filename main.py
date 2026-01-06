@@ -134,7 +134,6 @@ def webhook():
         return "ok", 200
 
     chat_id = msg["chat"]["id"]
-    message_id = msg.get("message_id", "")
     text = (msg.get("text") or "").strip()
 
     if text == "/start":

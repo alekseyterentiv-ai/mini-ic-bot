@@ -5,19 +5,21 @@ import requests
 from datetime import datetime
 
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 app = Flask(__name__)
 
 # --- ENV ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TG_API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
+
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
 SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ").strip()
 
-# Секрет с JSON сервис-аккаунта (в Cloud Run -> Variables & Secrets -> "Secrets exposed as env vars")
+# Secret with service account JSON (text content)
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 
-TG_API = f"https://api.telegram.org/bot{TOKEN}" if TOKEN else ""
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 @app.get("/")
@@ -25,8 +27,8 @@ def index():
     return "OK", 200
 
 
-def tg_send(chat_id: int, text: str):
-    if not TG_API:
+def send_message(chat_id: int, text: str):
+    if not TOKEN:
         print("ERROR: TELEGRAM_TOKEN is not set")
         return
     try:
@@ -37,71 +39,78 @@ def tg_send(chat_id: int, text: str):
         )
         print("sendMessage:", r.status_code, r.text)
     except Exception as e:
-        print("sendMessage exception:", repr(e))
+        print("sendMessage EX:", str(e))
 
 
-def get_sheets_service():
+def get_sheets_access_token() -> str:
     if not GOOGLE_SA_JSON:
         raise RuntimeError("GOOGLE_SA_JSON is not set")
 
     info = json.loads(GOOGLE_SA_JSON)
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    creds.refresh(GoogleAuthRequest())
+    return creds.token
 
 
 def append_row_to_sheet(row: list):
     if not SPREADSHEET_ID:
         raise RuntimeError("SPREADSHEET_ID is not set")
 
-    service = get_sheets_service()
-    # Пишем в лист ОПЕРАЦИИ, начиная с A
-    rng = f"{SHEET_OPS}!A:Z"
+    token = get_sheets_access_token()
+    sheet_encoded = requests.utils.quote(SHEET_OPS, safe="")
+
+    url = (
+        f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
+        f"/values/{sheet_encoded}!A:append"
+        f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+    )
+
+    headers = {"Authorization": f"Bearer {token}"}
     body = {"values": [row]}
 
-    resp = service.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=rng,
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body
-    ).execute()
+    r = requests.post(url, headers=headers, json=body, timeout=15)
+    print("append:", r.status_code, r.text)
 
-    return resp
+    if r.status_code >= 300:
+        raise RuntimeError(f"Sheets append failed: {r.status_code} {r.text}")
 
 
 def parse_line(text: str):
-    """
-    Ожидаем формат через ;
-    ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ
-    Коммент может быть пустым.
-    """
+    # Ожидаем: 0 Объект; 1 Тип; 2 Статья; 3 Сумма; 4 Оплата; 5 НДС; 6 Период; 7 Сотрудник; 8 Коммент (опц)
     parts = [p.strip() for p in text.split(";")]
-    # убираем пустые хвосты
-    while parts and parts[-1] == "":
-        parts.pop()
+    parts = [p for p in parts if p != ""]  # убираем пустые куски от ";;"
 
     if len(parts) < 8:
-        return None
+        return None, "Нужно минимум 8 полей через ';'. Пример:\nОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё"
 
     object_ = parts[0]
     type_ = parts[1]
     article = parts[2]
-    amount_raw = parts[3].replace(" ", "").replace(",", ".")
+
+    # сумма
+    raw_amount = parts[3].replace(" ", "").replace(",", ".")
+    try:
+        amount = float(raw_amount)
+    except:
+        return None, "Сумма должна быть числом. Пример: 10000"
+
     pay_type = parts[4]
     vat = parts[5]
     period = parts[6]
     employee = parts[7]
     comment = parts[8] if len(parts) >= 9 else ""
 
-    try:
-        amount = float(amount_raw)
-    except:
-        amount = amount_raw  # пусть Google Sheets сам попробует
-
-    return object_, type_, article, amount, pay_type, vat, period, employee, comment
+    return {
+        "object_": object_,
+        "type_": type_,
+        "article": article,
+        "amount": amount,
+        "pay_type": pay_type,
+        "vat": vat,
+        "period": period,
+        "employee": employee,
+        "comment": comment,
+    }, None
 
 
 @app.post("/webhook")
@@ -116,39 +125,42 @@ def webhook():
     chat_id = msg["chat"]["id"]
     text = (msg.get("text") or "").strip()
 
-    if text == "/start":
-        tg_send(chat_id, "Привет! Я на связи.\nФормат:\nОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ")
+    # /start (даже если дальше текст на новой строке)
+    if text.startswith("/start"):
+        send_message(chat_id, "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё")
         return "ok", 200
 
-    parsed = parse_line(text)
-    if not parsed:
-        tg_send(chat_id, "Не понял строку.\nНужно минимум 8 полей через ;\nПример:\nОБУХОВО; РАСХОД; КВАРТИРА; 10000; БЕЗНАЛ; ДА; 2026-01-01; ИВАНОВ И.И.; жильё")
+    # парсим строку
+    parsed, err = parse_line(text)
+    if err:
+        send_message(chat_id, err)
         return "ok", 200
 
-    object_, type_, article, amount, pay_type, vat, period, employee, comment = parsed
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # ВАЖНО: MessageID УБРАЛИ ПОЛНОСТЬЮ. Статус пустой.
+    # ВАЖНО: статус пустой, message_id НЕ ПИШЕМ
+    # A..L (12 колонок). Если у тебя есть M (MessageID) — она останется пустой автоматически.
     row = [
-        now,           # A DateTime
-        object_,       # B Объект
-        type_,         # C Тип
-        article,       # D Статья
-        amount,        # E СуммаБаза
-        pay_type,      # F СпособОплаты
-        vat,           # G НДС
-        "",            # H Категория
-        period,        # I ПЕРИОД
-        employee,      # J Сотрудник
-        "",            # K Статус (ПУСТО)
-        "TELEGRAM",    # L Источник
+        now,                    # A DateTime
+        parsed["object_"],       # B Объект
+        parsed["type_"],         # C Тип
+        parsed["article"],       # D Статья
+        parsed["amount"],        # E СуммаБаза
+        parsed["pay_type"],      # F СпособОплаты
+        parsed["vat"],           # G НДС
+        "",                      # H Категория (пусто)
+        parsed["period"],        # I ПЕРИОД
+        parsed["employee"],      # J Сотрудник
+        "",                      # K Статус (пусто)
+        "TELEGRAM",              # L Источник
+        # M MessageID — НЕ передаем
     ]
 
     try:
         append_row_to_sheet(row)
-        tg_send(chat_id, f"Записал: {object_} / {type_} / {article} / {amount}")
+        send_message(chat_id, f"Записал: {parsed['object_']} / {parsed['type_']} / {parsed['article']} / {parsed['amount']}")
     except Exception as e:
-        print("append error:", repr(e))
-        tg_send(chat_id, f"Ошибка записи в таблицу: {e}")
+        print("WRITE EX:", str(e))
+        send_message(chat_id, f"Ошибка записи в таблицу: {e}")
 
     return "ok", 200

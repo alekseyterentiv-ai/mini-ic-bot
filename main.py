@@ -1,10 +1,14 @@
-from flask import Flask, request
 import os
 import json
-import requests
+import re
 from datetime import datetime
+
+import requests
+from flask import Flask, request
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+
 
 app = Flask(__name__)
 
@@ -13,136 +17,203 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TG_API = f"https://api.telegram.org/bot{TOKEN}"
 
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
-SHEET_OPS = os.environ.get("SHEET_OPS", "").strip()
+SHEET_OPS = os.environ.get("SHEET_OPS", "ОПЕРАЦИИ").strip()
+
+# GOOGLE_SA_JSON = json string (из Secret Manager exposed as env)
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# --- Google Sheets ---
-creds = service_account.Credentials.from_service_account_info(
-    json.loads(GOOGLE_SA_JSON),
-    scopes=SCOPES
-)
-gs = build("sheets", "v4", credentials=creds).spreadsheets()
+# Период: YYYY-MM-1 или YYYY-MM-2
+PERIOD_RE = re.compile(r"^\d{4}-\d{2}-[12]$")
 
-# --- helpers ---
-def tg_send(chat_id, text):
-    requests.post(
-        f"{TG_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
-        timeout=10
-    )
 
-def period_ok(p: str):
-    return (
-        len(p) == 8 and
-        p[4] == "-" and
-        p[7] in ("1", "2") and
-        p[:4].isdigit() and
-        p[5:7].isdigit()
-    )
-
-def is_duplicate(message_id: int) -> bool:
-    resp = gs.values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=f"{SHEET_OPS}!M:M"
-    ).execute()
-    values = resp.get("values", [])
-    return any(str(message_id) == row[0] for row in values if row)
-
-def parse_message(text: str):
-    parts = [p.strip() for p in text.split(";")]
-    if len(parts) != 9:
-        return None, "❌ Нужно ровно 9 полей через ;"
-
-    object_, type_, article, amount_raw, pay_type, vat, period, employee, comment = parts
-
-    if type_.upper() not in ("РАСХОД", "ПРИХОД"):
-        return None, "❌ Тип только РАСХОД или ПРИХОД"
-
+def tg_send(chat_id: int, text: str):
     try:
-        amount = float(amount_raw.replace(" ", "").replace(",", "."))
-        if amount <= 0:
-            raise ValueError
-    except:
-        return None, "❌ Сумма некорректна"
+        requests.post(
+            f"{TG_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=10,
+        )
+    except Exception:
+        pass
 
-    vat = vat.upper()
-    if vat not in ("ДА", "НЕТ"):
+
+def get_sheets_service():
+    if not GOOGLE_SA_JSON:
+        raise RuntimeError("GOOGLE_SA_JSON is empty")
+    info = json.loads(GOOGLE_SA_JSON)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+def validate_and_parse(text: str):
+    parts = [p.strip() for p in text.split(";")]
+
+    if len(parts) != 9:
+        return None, "❌ Ошибка формата: должно быть 9 полей через ;"
+
+    object_, type_, article, amount_raw, pay_type, vat, period_raw, employee, comment = parts
+
+    # Тип
+    type_up = type_.upper()
+    if type_up not in ("РАСХОД", "ПРИХОД"):
+        return None, "❌ Тип должен быть РАСХОД или ПРИХОД"
+
+    # Сумма
+    try:
+        amt = amount_raw.replace(" ", "").replace(",", ".")
+        amount = float(amt)
+        if amount <= 0:
+            return None, "❌ Сумма должна быть больше 0"
+    except Exception:
+        return None, "❌ Сумма должна быть числом"
+
+    # НДС
+    vat_up = vat.upper()
+    if vat_up not in ("ДА", "НЕТ"):
         return None, "❌ НДС только ДА или НЕТ"
 
-    if not period_ok(period):
+    # Период (НЕ дата!)
+    period = period_raw.strip()
+    if not PERIOD_RE.match(period):
         return None, "❌ Период только YYYY-MM-1 или YYYY-MM-2"
+
+    # Минимальная проверка обязательных
+    if not object_ or not article or not pay_type:
+        return None, "❌ Не хватает обязательных полей: объект; статья; способ оплаты"
 
     return {
         "object": object_,
-        "type": type_.upper(),
+        "type": type_up,
         "article": article,
         "amount": amount,
         "pay_type": pay_type,
-        "vat": vat,
+        "vat": vat_up,
         "period": period,
         "employee": employee,
-        "comment": comment
+        "comment": comment,
     }, None
 
-# --- routes ---
+
+def load_recent_message_keys(service, limit=500):
+    """
+    Берем колонку M (MessageID) и делаем set последних значений.
+    Чтобы быстро и стабильно.
+    """
+    resp = (
+        service.spreadsheets()
+        .values()
+        .get(spreadsheetId=SPREADSHEET_ID, range=f"{SHEET_OPS}!M2:M")
+        .execute()
+    )
+    values = resp.get("values", [])
+    flat = [row[0] for row in values if row]
+    if len(flat) > limit:
+        flat = flat[-limit:]
+    return set(flat)
+
+
+def append_row(service, row):
+    # ВАЖНО: range = только имя листа (без !A)
+    return (
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=SHEET_OPS,
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]},
+        )
+        .execute()
+    )
+
+
 @app.get("/")
 def index():
-    return "OK", 200
+    return "ok"
+
 
 @app.post("/webhook")
 def webhook():
     data = request.get_json(silent=True) or {}
-    msg = data.get("message")
-    if not msg or "text" not in msg:
-        return "ok", 200
 
-    chat_id = msg["chat"]["id"]
-    text = msg["text"].strip()
-    message_id = msg["message_id"]
+    msg = data.get("message") or data.get("edited_message")
+    if not msg:
+        return ("ok", 200)
 
-    if text == "/start":
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not chat_id:
+        return ("ok", 200)
+
+    # /start
+    if text.startswith("/start"):
         tg_send(
             chat_id,
-            "Формат:\n"
-            "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий"
+            "Привет! Я на связи.\nФормат:\nОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; комментарий",
         )
-        return "ok", 200
+        return ("ok", 200)
 
-    if is_duplicate(message_id):
-        tg_send(chat_id, "⚠️ Это сообщение уже записано")
-        return "ok", 200
+    parsed, err = validate_and_parse(text)
+    if err:
+        tg_send(chat_id, err)
+        return ("ok", 200)
 
-    parsed, error = parse_message(text)
-    if error:
-        tg_send(chat_id, error)
-        return "ok", 200
+    # message_id + chat_id => уникальный ключ
+    message_id = msg.get("message_id")
+    message_key = f"{chat_id}:{message_id}" if message_id is not None else ""
 
+    # now
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Row строго под колонки:
+    # A Datetime
+    # B Объект
+    # C Тип
+    # D Статья
+    # E СуммаБаза
+    # F СпособОплаты
+    # G НДС
+    # H Категория (пусто)
+    # I ПЕРИОД
+    # J Сотрудник
+    # K Статус (пусто)
+    # L Источник
+    # M MessageID
+    # N Комментарий
     row = [
-        now,                       # A DateTime
-        parsed["object"],          # B Объект
-        parsed["type"],            # C Тип
-        parsed["article"],         # D Статья
-        parsed["amount"],          # E Сумма
-        parsed["pay_type"],        # F Способ оплаты
-        parsed["vat"],             # G НДС
-        "",                         # H Категория
-        parsed["period"],          # I Период
-        parsed["employee"],        # J Сотрудник
-        "",                         # K Статус
-        "TELEGRAM",                 # L Источник
-        message_id                 # M MessageID (АНТИДУБЛЬ)
+        now,
+        parsed["object"],
+        parsed["type"],
+        parsed["article"],
+        parsed["amount"],
+        parsed["pay_type"],
+        parsed["vat"],
+        "",
+        parsed["period"],
+        parsed["employee"],
+        "",
+        "TELEGRAM",
+        message_key,
+        parsed["comment"],
     ]
 
-    gs.values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range=SHEET_OPS,
-        valueInputOption="USER_ENTERED",
-        body={"values": [row]}
-    ).execute()
+    try:
+        service = get_sheets_service()
 
-    tg_send(chat_id, "✅ Записал")
-    return "ok", 200
+        # антидубли
+        if message_key:
+            existing = load_recent_message_keys(service, limit=500)
+            if message_key in existing:
+                tg_send(chat_id, "⚠️ Уже записано (дубль).")
+                return ("ok", 200)
+
+        append_row(service, row)
+        tg_send(chat_id, "✅ Записал")
+
+    except Exception as e:
+        tg_send(chat_id, f"Ошибка записи в таблицу: {e}")
+
+    return ("ok", 200)

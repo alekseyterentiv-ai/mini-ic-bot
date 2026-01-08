@@ -26,6 +26,10 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Webhook security (Telegram secret token header)
 TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN", "").strip()
 
+# (опционально) ограничение доступа по chat_id, если захочешь
+# ALLOWED_CHAT_IDS="123,-100555,..." (через запятую)
+ALLOWED_CHAT_IDS = os.environ.get("ALLOWED_CHAT_IDS", "").strip()
+
 # =========================
 # СПРАВОЧНИКИ
 # =========================
@@ -39,7 +43,7 @@ OBJECTS = [
     "ОБЩЕХОЗ",
 ]
 
-# Типы как ты сказал: расход, зп, аванс, доход
+# Типы: расход, зп, аванс, доход
 TYPES = ["РАСХОД", "ЗП", "АВАНС", "ДОХОД"]
 
 ARTICLES = [
@@ -86,6 +90,10 @@ _seen_content = {}       # (chat_id, norm_text) -> ts
 _new_flow = {}           # chat_id -> {"step": int, "data": dict, "ts": float}
 NEW_FLOW_TTL = 30 * 60   # 30 минут
 
+# /bulk flow state
+_bulk_flow = {}          # chat_id -> {"step": int, "hdr": dict, "items": list, "ts": float}
+BULK_FLOW_TTL = 30 * 60  # 30 минут
+
 _sheets_service = None
 _sheet_id_cache = {}     # title -> sheetId
 
@@ -120,6 +128,12 @@ def _cleanup_caches(now_ts: float) -> None:
     for k in to_del:
         _seen_content.pop(k, None)
 
+def is_allowed_chat(chat_id: int) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    allowed = {x.strip() for x in ALLOWED_CHAT_IDS.split(",") if x.strip()}
+    return str(chat_id) in allowed
+
 def quick_help_text():
     return (
         "⚡ Быстрый ввод (/quick)\n\n"
@@ -129,6 +143,23 @@ def quick_help_text():
         "ОБУХОВО; РАСХОД; КВАРТИРА; 35000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; январь\n\n"
         "Период: YYYY-MM-1 или YYYY-MM-2\n"
         "1=1–15, 2=16–31"
+    )
+
+def bulk_help_text():
+    return (
+        "🧠 Массовый ввод авансов (/bulk)\n\n"
+        "1) /bulk\n"
+        "2) ШАПКА (1 строка):\n"
+        "ОБЪЕКТ; СТАТЬЯ; СПОСОБ; НДС; ПЕРИОД; КОММЕНТ\n"
+        "Пример:\n"
+        "ОДИНЦОВО; ЗП НАЛ; НАЛ; НЕТ; 2026-01-1; авансы\n\n"
+        "3) Потом кидаешь строки сотрудников (каждая строка = 1 запись):\n"
+        "Маматисойв Акмалжон - 5к\n"
+        "Тогаев Шохрух 13000\n"
+        "Ахмедов Отабек = 3000\n\n"
+        "4) Завершить и записать: /done\n"
+        "Отменить пачку: /undo_bulk\n"
+        "Отмена режима: /cancel"
     )
 
 # =========================
@@ -217,6 +248,31 @@ def delete_row(sheet_name: str, row_number_1based: int):
         }
     ).execute()
 
+def delete_rows(sheet_name: str, row_numbers_1based: list[int]):
+    # удаляем с конца, чтобы индексы не съезжали
+    if not row_numbers_1based:
+        return
+    svc = build_sheets_service()
+    sid = _get_sheet_id(svc, sheet_name)
+    reqs = []
+    for rn in sorted(row_numbers_1based, reverse=True):
+        start = rn - 1
+        end = rn
+        reqs.append({
+            "deleteDimension": {
+                "range": {
+                    "sheetId": sid,
+                    "dimension": "ROWS",
+                    "startIndex": start,
+                    "endIndex": end,
+                }
+            }
+        })
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID,
+        body={"requests": reqs}
+    ).execute()
+
 # =========================
 # LOGS
 # =========================
@@ -254,6 +310,22 @@ def get_last_written_message_id_from_logs(chat_id: int):
             continue
     return None
 
+def get_last_bulk_batch_id(chat_id: int):
+    rows = read_sheet_rows(SHEET_LOGS, "A:J")
+    if not rows:
+        return None
+    for r in reversed(rows):
+        try:
+            r_chat = str(r[1]).strip() if len(r) > 1 else ""
+            r_status = str(r[7]).strip() if len(r) > 7 else ""
+            r_err = str(r[8]).strip() if len(r) > 8 else ""
+            # batch_id кладём в error_text для простоты
+            if r_chat == str(chat_id) and r_status == "BULK_WRITE OK" and r_err:
+                return r_err
+        except:
+            continue
+    return None
+
 def find_row_by_message_id_in_ops(target_message_id: str):
     if not target_message_id:
         return None
@@ -264,6 +336,19 @@ def find_row_by_message_id_in_ops(target_message_id: str):
         if str(col_m[idx]).strip() == str(target_message_id).strip():
             return idx + 1
     return None
+
+def find_rows_by_batch_id_in_ops(batch_id: str):
+    # batch_id будет в колонке N (Комментарий)
+    if not batch_id:
+        return []
+    col_n = read_column(SHEET_OPS, "N:N")
+    if not col_n:
+        return []
+    rows = []
+    for idx in range(len(col_n) - 1, -1, -1):
+        if batch_id in str(col_n[idx] or ""):
+            rows.append(idx + 1)
+    return rows
 
 # =========================
 # VALIDATION (быстрый ввод через ;)
@@ -389,8 +474,62 @@ def _ask_step(chat_id: int, step: int):
     elif step == 9:
         send_message(chat_id, "Шаг 9/9: Комментарий (можно “-”):", kb([["/back", "/cancel"]]))
 
+# =========================
+# /bulk FLOW
+# =========================
+def _bulk_get(chat_id: int):
+    st = _bulk_flow.get(chat_id)
+    if not st:
+        return None
+    if time.time() - st.get("ts", 0) > BULK_FLOW_TTL:
+        _bulk_flow.pop(chat_id, None)
+        return None
+    return st
+
+def _bulk_set(chat_id: int, step: int, hdr: dict, items: list):
+    _bulk_flow[chat_id] = {"step": step, "hdr": hdr, "items": items, "ts": time.time()}
+
+def _bulk_clear(chat_id: int):
+    _bulk_flow.pop(chat_id, None)
+
+_amount_end_re = re.compile(r"(\d[\d\s]*([.,]\d+)?)(\s*[кk])?\s*$", re.IGNORECASE)
+
+def _parse_amount_and_name(line: str):
+    s = (line or "").strip()
+    if not s:
+        return None, None
+
+    # убираем нумерацию в начале: "1) ..." / "1. ..." / "1 - ..."
+    s = re.sub(r"^\s*\d+\s*[\)\.\-]\s*", "", s)
+
+    # заменяем " = " на пробел
+    s = s.replace("=", " ").replace("—", "-")
+
+    m = _amount_end_re.search(s)
+    if not m:
+        return None, s.strip()
+
+    raw_num = (m.group(1) or "").replace(" ", "").replace(",", ".")
+    suffix = (m.group(3) or "").strip().lower()
+
+    try:
+        val = float(raw_num)
+        if suffix in ("к", "k"):
+            val = val * 1000.0
+        if val <= 0:
+            return None, s.strip()
+    except:
+        return None, s.strip()
+
+    name = s[:m.start()].strip(" ;:-\t")
+    if not name:
+        return None, None
+    return val, name
+
+# =========================
+# WRITE OP
+# =========================
 def _write_operation(parsed: dict, message_id):
-    # ОПЕРАЦИИ: A..N (N = Комментарий)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [
         now_str,                 # A DateTime
@@ -406,7 +545,7 @@ def _write_operation(parsed: dict, message_id):
         "",                      # K Статус
         "TELEGRAM",              # L Источник
         str(message_id or ""),   # M MessageID
-        parsed["comment"],       # N Комментарий
+        parsed.get("comment", ""),  # N Комментарий
     ]
     append_row(SHEET_OPS, row)
 
@@ -420,7 +559,6 @@ def index():
 @app.post("/webhook")
 def webhook():
     # --- Webhook security ---
-    # Telegram sends header "X-Telegram-Bot-Api-Secret-Token" if you set secret_token in setWebhook
     if TELEGRAM_SECRET_TOKEN:
         got = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
         if got != TELEGRAM_SECRET_TOKEN:
@@ -438,12 +576,24 @@ def webhook():
     if not chat_id:
         return "no chat", 200
 
+    if not is_allowed_chat(chat_id):
+        return "forbidden chat", 200
+
     user_id = from_user.get("id")
     username = from_user.get("username", "")
     full_name = (" ".join([from_user.get("first_name", ""), from_user.get("last_name", "")])).strip()
 
     message_id = msg.get("message_id")
     text = (msg.get("text") or "").strip()
+
+    # ---------- /whoami ----------
+    if text.strip().lower() == "/whoami":
+        send_message(
+            chat_id,
+            f"chat_id: {chat_id}\nuser_id: {user_id}\nusername: @{username}\nname: {full_name}"
+        )
+        log_event(chat_id, user_id, username, full_name, message_id, text, "WHOAMI OK")
+        return "ok", 200
 
     # ---------- /start ----------
     if text.startswith("/start"):
@@ -452,9 +602,13 @@ def webhook():
             "Команды:\n"
             "/new — пошаговый ввод\n"
             "/quick — быстрый ввод (формат)\n"
+            "/bulk — массовый ввод авансов\n"
+            "/done — закончить /bulk и записать\n"
             "/undo — отмена последней операции\n"
-            "/cancel — отмена пошагового ввода\n"
-            "/back — шаг назад (в /new)\n\n"
+            "/undo_bulk — отмена последней массовой пачки\n"
+            "/cancel — отмена режима\n"
+            "/back — шаг назад (в /new)\n"
+            "/whoami — показать id\n\n"
             + quick_help_text()
         )
         log_event(chat_id, user_id, username, full_name, message_id, text, "START OK")
@@ -466,18 +620,99 @@ def webhook():
         log_event(chat_id, user_id, username, full_name, message_id, text, "QUICK OK")
         return "ok", 200
 
-    # ---------- /new /cancel ----------
+    # ---------- /bulk ----------
+    if text.strip().lower() == "/bulk":
+        _newflow_clear(chat_id)
+        _bulk_set(chat_id, 1, {}, [])
+        send_message(chat_id, bulk_help_text())
+        send_message(chat_id, "Шаг 1/2: пришли ШАПКУ (ОБЪЕКТ; СТАТЬЯ; СПОСОБ; НДС; ПЕРИОД; КОММЕНТ).", kb([["/cancel"]]))
+        log_event(chat_id, user_id, username, full_name, message_id, text, "BULK START")
+        return "ok", 200
+
+    # ---------- /done ----------
+    if text.strip().lower() == "/done":
+        st = _bulk_get(chat_id)
+        if not st:
+            send_message(chat_id, "⚠️ Нет активного /bulk. Начни с /bulk")
+            return "ok", 200
+
+        hdr = st["hdr"]
+        items = st["items"]
+
+        if not hdr:
+            send_message(chat_id, "⚠️ Сначала нужна шапка. Напиши шапку как в примере.")
+            return "ok", 200
+
+        if not items:
+            send_message(chat_id, "⚠️ Список пуст. Пришли строки 'ФИО сумма' и снова /done")
+            return "ok", 200
+
+        batch_id = f"BULK-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        ok_cnt = 0
+        bad = 0
+
+        for it in items:
+            try:
+                parsed = {
+                    "object": hdr["object"],
+                    "type": "АВАНС",
+                    "article": hdr["article"],
+                    "amount": it["amount"],
+                    "pay_type": hdr["pay_type"],
+                    "vat": hdr["vat"],
+                    "period": hdr["period"],
+                    "employee": it["name"],
+                    "comment": f'{hdr.get("comment","").strip()} [{batch_id}]'.strip(),
+                }
+                _write_operation(parsed, message_id)
+                ok_cnt += 1
+            except Exception as e:
+                bad += 1
+                print("bulk write item error:", it, repr(e))
+
+        _bulk_clear(chat_id)
+
+        send_message(chat_id, f"✅ Массово записал: {ok_cnt} строк(а). Ошибок: {bad}. Batch: {batch_id}")
+        log_event(chat_id, user_id, username, full_name, message_id, "/done", "BULK_WRITE OK", batch_id)
+        return "ok", 200
+
+    # ---------- /undo_bulk ----------
+    if text.strip().lower() == "/undo_bulk":
+        try:
+            batch_id = get_last_bulk_batch_id(chat_id)
+            if not batch_id:
+                send_message(chat_id, "⚠️ Не нашёл последнюю массовую пачку в логах.")
+                return "ok", 200
+
+            rows = find_rows_by_batch_id_in_ops(batch_id)
+            if not rows:
+                send_message(chat_id, f"⚠️ Не нашёл строки в ОПЕРАЦИИ для batch {batch_id}")
+                return "ok", 200
+
+            delete_rows(SHEET_OPS, rows)
+            send_message(chat_id, f"✅ Удалил массовую пачку: {len(rows)} строк(а). Batch: {batch_id}")
+            log_event(chat_id, user_id, username, full_name, message_id, "/undo_bulk", "BULK_UNDO OK", batch_id)
+            return "ok", 200
+        except Exception as e:
+            send_message(chat_id, f"❌ Ошибка /undo_bulk: {e}")
+            log_event(chat_id, user_id, username, full_name, message_id, "/undo_bulk", "BULK_UNDO ERR", str(e))
+            return "ok", 200
+
+    # ---------- /new ----------
     if text.strip() == "/new":
+        _bulk_clear(chat_id)
         _newflow_set(chat_id, 1, {})
         send_message(chat_id, "🧾 Пошаговый ввод. Отвечай по шагам. /cancel — отмена.", kb([["/cancel"]]))
         _ask_step(chat_id, 1)
         log_event(chat_id, user_id, username, full_name, message_id, text, "NEW START")
         return "ok", 200
 
+    # ---------- /cancel ----------
     if text.strip() == "/cancel":
         _newflow_clear(chat_id)
-        send_message(chat_id, "❎ Ок, отменил ввод.", kb([["/new", "/quick"], ["/undo"]]))
-        log_event(chat_id, user_id, username, full_name, message_id, text, "NEW CANCEL")
+        _bulk_clear(chat_id)
+        send_message(chat_id, "❎ Ок, отменил режим.", kb([["/new", "/quick"], ["/bulk"], ["/undo", "/undo_bulk"]]))
+        log_event(chat_id, user_id, username, full_name, message_id, text, "CANCEL OK")
         return "ok", 200
 
     # ---------- /undo ----------
@@ -527,6 +762,67 @@ def webhook():
             log_event(chat_id, user_id, username, full_name, message_id, text, "DEDUP TEXT")
             return "dup content", 200
         _seen_content[key] = now_ts
+
+    # ---------- /bulk flow processing ----------
+    st_bulk = _bulk_get(chat_id)
+    if st_bulk:
+        step = st_bulk["step"]
+        hdr = st_bulk["hdr"]
+        items = st_bulk["items"]
+
+        # step 1: header
+        if step == 1:
+            parts = [p.strip() for p in (text or "").split(";")]
+            if len(parts) < 5:
+                send_message(chat_id, "❌ Шапка неверная. Нужно: ОБЪЕКТ; СТАТЬЯ; СПОСОБ; НДС; ПЕРИОД; КОММЕНТ")
+                return "ok", 200
+
+            object_ = parts[0]
+            article = parts[1]
+            pay_type = parts[2]
+            vat = (parts[3] or "").upper()
+            period = parts[4]
+            comment = parts[5] if len(parts) >= 6 else "авансы"
+
+            if object_ not in OBJECTS:
+                send_message(chat_id, "❌ Объект не из списка.")
+                return "ok", 200
+            if article not in ARTICLES:
+                send_message(chat_id, "❌ Статья не из списка.")
+                return "ok", 200
+            if pay_type not in PAY_TYPES:
+                send_message(chat_id, "❌ Способ оплаты не из списка.")
+                return "ok", 200
+            if vat not in VAT_VALUES:
+                send_message(chat_id, "❌ НДС только ДА или НЕТ.")
+                return "ok", 200
+            if not re.match(r"^\d{4}-\d{2}-[12]$", period.strip()):
+                send_message(chat_id, "❌ Период только YYYY-MM-1 или YYYY-MM-2 (пример: 2026-01-1).")
+                return "ok", 200
+
+            hdr = {
+                "object": object_,
+                "article": article,
+                "pay_type": pay_type,
+                "vat": vat,
+                "period": period.strip(),
+                "comment": (comment or "").strip(),
+            }
+            _bulk_set(chat_id, 2, hdr, [])
+            send_message(chat_id, "Шаг 2/2: кидай строки 'ФИО сумма'. Когда закончишь — /done", kb([["/done"], ["/cancel"]]))
+            return "ok", 200
+
+        # step 2: items lines
+        if step == 2:
+            val, name = _parse_amount_and_name(text)
+            if not name or val is None:
+                send_message(chat_id, "❌ Строка должна быть как: ФИО 3000 (или ФИО - 5к)")
+                return "ok", 200
+
+            items.append({"name": name, "amount": float(val)})
+            _bulk_set(chat_id, 2, hdr, items)
+            send_message(chat_id, f"➕ Добавил: {name} — {int(val) if float(val).is_integer() else val}")
+            return "ok", 200
 
     # ---------- /new flow processing ----------
     st = _newflow_get(chat_id)
@@ -672,4 +968,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-

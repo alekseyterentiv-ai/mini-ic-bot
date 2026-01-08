@@ -5,7 +5,6 @@ import time
 import re
 import requests
 from datetime import datetime
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -24,6 +23,9 @@ SHEET_LOGS = os.environ.get("SHEET_LOGS", "ЛОГИ").strip()
 GOOGLE_SA_JSON = os.environ.get("GOOGLE_SA_JSON", "").strip()
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Webhook security (Telegram secret token header)
+TELEGRAM_SECRET_TOKEN = os.environ.get("TELEGRAM_SECRET_TOKEN", "").strip()
+
 # =========================
 # СПРАВОЧНИКИ
 # =========================
@@ -37,6 +39,7 @@ OBJECTS = [
     "ОБЩЕХОЗ",
 ]
 
+# Типы как ты сказал: расход, зп, аванс, доход
 TYPES = ["РАСХОД", "ЗП", "АВАНС", "ДОХОД"]
 
 ARTICLES = [
@@ -86,7 +89,6 @@ NEW_FLOW_TTL = 30 * 60   # 30 минут
 _sheets_service = None
 _sheet_id_cache = {}     # title -> sheetId
 
-
 # =========================
 # TELEGRAM HELPERS
 # =========================
@@ -97,7 +99,6 @@ def kb(rows):
         "one_time_keyboard": True
     }
 
-
 def send_message(chat_id: int, text: str, reply_markup=None) -> None:
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -107,10 +108,8 @@ def send_message(chat_id: int, text: str, reply_markup=None) -> None:
     except Exception as e:
         print("send_message error:", repr(e))
 
-
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
-
 
 def _cleanup_caches(now_ts: float) -> None:
     to_del = [k for k, ts in _seen_message_ids.items() if now_ts - ts > DEDUP_TTL_SECONDS]
@@ -121,6 +120,16 @@ def _cleanup_caches(now_ts: float) -> None:
     for k in to_del:
         _seen_content.pop(k, None)
 
+def quick_help_text():
+    return (
+        "⚡ Быстрый ввод (/quick)\n\n"
+        "Формат (9 полей через ;):\n"
+        "ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ\n\n"
+        "Пример:\n"
+        "ОБУХОВО; РАСХОД; КВАРТИРА; 35000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; январь\n\n"
+        "Период: YYYY-MM-1 или YYYY-MM-2\n"
+        "1=1–15, 2=16–31"
+    )
 
 # =========================
 # GOOGLE SHEETS HELPERS
@@ -137,7 +146,6 @@ def build_sheets_service():
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return _sheets_service
-
 
 def _get_sheet_id(service, title: str) -> int:
     if title in _sheet_id_cache:
@@ -157,7 +165,6 @@ def _get_sheet_id(service, title: str) -> int:
 
     raise RuntimeError(f"Sheet '{title}' not found")
 
-
 def append_row(sheet_name: str, row: list):
     svc = build_sheets_service()
     svc.spreadsheets().values().append(
@@ -168,7 +175,6 @@ def append_row(sheet_name: str, row: list):
         body={"majorDimension": "ROWS", "values": [row]},
     ).execute()
 
-
 def read_sheet_rows(sheet_name: str, rng: str):
     svc = build_sheets_service()
     resp = svc.spreadsheets().values().get(
@@ -177,7 +183,6 @@ def read_sheet_rows(sheet_name: str, rng: str):
         majorDimension="ROWS"
     ).execute()
     return resp.get("values", [])
-
 
 def read_column(sheet_name: str, col: str):
     svc = build_sheets_service()
@@ -189,16 +194,11 @@ def read_column(sheet_name: str, col: str):
     cols = resp.get("values", [])
     return cols[0] if cols and cols[0] else []
 
-
 def delete_row(sheet_name: str, row_number_1based: int):
-    if row_number_1based <= 0:
-        raise ValueError("row_number must be >= 1")
     svc = build_sheets_service()
     sid = _get_sheet_id(svc, sheet_name)
-
     start = row_number_1based - 1
     end = row_number_1based
-
     svc.spreadsheets().batchUpdate(
         spreadsheetId=SPREADSHEET_ID,
         body={
@@ -216,7 +216,6 @@ def delete_row(sheet_name: str, row_number_1based: int):
             ]
         }
     ).execute()
-
 
 # =========================
 # LOGS
@@ -240,12 +239,10 @@ def log_event(chat_id, user_id, username, full_name, message_id, text, status, e
     except Exception as e:
         print("log_event error:", repr(e))
 
-
 def get_last_written_message_id_from_logs(chat_id: int):
     rows = read_sheet_rows(SHEET_LOGS, "A:J")
     if not rows:
         return None
-
     for r in reversed(rows):
         try:
             r_chat = str(r[1]).strip() if len(r) > 1 else ""
@@ -257,18 +254,16 @@ def get_last_written_message_id_from_logs(chat_id: int):
             continue
     return None
 
-
 def find_row_by_message_id_in_ops(target_message_id: str):
     if not target_message_id:
         return None
-    col_m = read_column(SHEET_OPS, "M:M")
+    col_m = read_column(SHEET_OPS, "M:M")  # MessageID column
     if not col_m:
         return None
     for idx in range(len(col_m) - 1, -1, -1):
         if str(col_m[idx]).strip() == str(target_message_id).strip():
             return idx + 1
     return None
-
 
 # =========================
 # VALIDATION (быстрый ввод через ;)
@@ -325,9 +320,8 @@ def validate_and_parse(text: str):
         "vat": vat_up,
         "period": period_raw,
         "employee": employee.strip(),
-        "comment": comment.strip(),
+        "comment": (comment or "").strip(),
     }, None
-
 
 # =========================
 # /new FLOW
@@ -341,14 +335,11 @@ def _newflow_get(chat_id: int):
         return None
     return st
 
-
 def _newflow_set(chat_id: int, step: int, data: dict):
     _new_flow[chat_id] = {"step": step, "data": data, "ts": time.time()}
 
-
 def _newflow_clear(chat_id: int):
     _new_flow.pop(chat_id, None)
-
 
 def _ask_step(chat_id: int, step: int):
     if step == 1:
@@ -398,8 +389,8 @@ def _ask_step(chat_id: int, step: int):
     elif step == 9:
         send_message(chat_id, "Шаг 9/9: Комментарий (можно “-”):", kb([["/back", "/cancel"]]))
 
-
-def _write_operation(parsed: dict, message_id: int | None):
+def _write_operation(parsed: dict, message_id):
+    # ОПЕРАЦИИ: A..N (N = Комментарий)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row = [
         now_str,                 # A DateTime
@@ -419,26 +410,6 @@ def _write_operation(parsed: dict, message_id: int | None):
     ]
     append_row(SHEET_OPS, row)
 
-
-# =========================
-# TEXTS
-# =========================
-def quick_help_text():
-    return (
-        "⚡ Быстрый ввод\n"
-        "Формат:\n"
-        "ОБЪЕКТ; ТИП; СТАТЬЯ; СУММА; СПОСОБ; НДС; ПЕРИОД; СОТРУДНИК; КОММЕНТ\n\n"
-        "Пример:\n"
-        "ОБУХОВО; РАСХОД; КВАРТИРА; 1000; НАЛ; НЕТ; 2026-01-1; ИВАНОВ; январь\n\n"
-        "Команды:\n"
-        "/new — пошаговый ввод\n"
-        "/quick — подсказка по быстрому вводу\n"
-        "/undo — отмена последней записи\n"
-        "/cancel — отмена пошагового ввода\n"
-        "/back — шаг назад (в /new)"
-    )
-
-
 # =========================
 # ROUTES
 # =========================
@@ -446,9 +417,15 @@ def quick_help_text():
 def index():
     return "ok", 200
 
-
 @app.post("/webhook")
 def webhook():
+    # --- Webhook security ---
+    # Telegram sends header "X-Telegram-Bot-Api-Secret-Token" if you set secret_token in setWebhook
+    if TELEGRAM_SECRET_TOKEN:
+        got = (request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+        if got != TELEGRAM_SECRET_TOKEN:
+            return "forbidden", 403
+
     data = request.get_json(silent=True) or {}
     msg = data.get("message") or data.get("edited_message")
     if not msg:
@@ -468,36 +445,43 @@ def webhook():
     message_id = msg.get("message_id")
     text = (msg.get("text") or "").strip()
 
-    cmd = text.strip().split()[0] if text else ""
-
     # ---------- /start ----------
-    if cmd == "/start":
-        send_message(chat_id, quick_help_text())
+    if text.startswith("/start"):
+        send_message(
+            chat_id,
+            "Команды:\n"
+            "/new — пошаговый ввод\n"
+            "/quick — быстрый ввод (формат)\n"
+            "/undo — отмена последней операции\n"
+            "/cancel — отмена пошагового ввода\n"
+            "/back — шаг назад (в /new)\n\n"
+            + quick_help_text()
+        )
         log_event(chat_id, user_id, username, full_name, message_id, text, "START OK")
         return "ok", 200
 
     # ---------- /quick ----------
-    if cmd == "/quick":
+    if text.strip().lower() == "/quick":
         send_message(chat_id, quick_help_text())
         log_event(chat_id, user_id, username, full_name, message_id, text, "QUICK OK")
         return "ok", 200
 
     # ---------- /new /cancel ----------
-    if cmd == "/new":
+    if text.strip() == "/new":
         _newflow_set(chat_id, 1, {})
         send_message(chat_id, "🧾 Пошаговый ввод. Отвечай по шагам. /cancel — отмена.", kb([["/cancel"]]))
         _ask_step(chat_id, 1)
         log_event(chat_id, user_id, username, full_name, message_id, text, "NEW START")
         return "ok", 200
 
-    if cmd == "/cancel":
+    if text.strip() == "/cancel":
         _newflow_clear(chat_id)
-        send_message(chat_id, "❎ Ок, отменил ввод.", kb([["/new"], ["/quick"], ["/undo"]]))
+        send_message(chat_id, "❎ Ок, отменил ввод.", kb([["/new", "/quick"], ["/undo"]]))
         log_event(chat_id, user_id, username, full_name, message_id, text, "NEW CANCEL")
         return "ok", 200
 
     # ---------- /undo ----------
-    if cmd.lower() == "/undo":
+    if text.strip().lower() == "/undo":
         try:
             target_mid = get_last_written_message_id_from_logs(chat_id)
             if not target_mid:
@@ -522,22 +506,18 @@ def webhook():
             log_event(chat_id, user_id, username, full_name, message_id, text, "UNDO ERR", str(e))
             return "ok", 200
 
-    # Если пришла неизвестная команда (начинается с /) — покажем подсказку
-    if cmd.startswith("/"):
-        send_message(chat_id, "❌ Неизвестная команда.\n\n" + quick_help_text())
-        log_event(chat_id, user_id, username, full_name, message_id, text, "CMD UNKNOWN")
-        return "ok", 200
-
     # ---------- Anti-dup ----------
     now_ts = time.time()
     _cleanup_caches(now_ts)
 
+    # MessageID dedup (молча)
     if message_id is not None:
         if message_id in _seen_message_ids:
             log_event(chat_id, user_id, username, full_name, message_id, text, "DEDUP MESSAGE_ID")
             return "dup message_id", 200
         _seen_message_ids[message_id] = now_ts
 
+    # Content dedup (с уведомлением)
     norm_text = normalize_text(text)
     if norm_text:
         key = (chat_id, norm_text)
@@ -554,7 +534,7 @@ def webhook():
         step = st["step"]
         data_nf = st["data"]
 
-        if cmd == "/back":
+        if text.strip() == "/back":
             step = max(1, step - 1)
             _newflow_set(chat_id, step, data_nf)
             _ask_step(chat_id, step)
@@ -689,7 +669,7 @@ def webhook():
 
     return "ok", 200
 
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
